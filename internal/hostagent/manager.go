@@ -33,8 +33,8 @@ type VMEndpoint struct {
 }
 
 type Config struct {
-	KernelImagePath string        // shared vmlinux, platform-owned (§4.6)
-	GuestPort       int           // fixed platform convention (§4.3), e.g. 8080
+	KernelImagePath string // shared vmlinux, platform-owned (§4.6)
+	GuestPort       int    // fixed platform convention (§4.3), e.g. 8080
 	BootTimeout     time.Duration
 }
 
