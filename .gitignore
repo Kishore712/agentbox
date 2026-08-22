@@ -1,0 +1,6 @@
+.DS_Store
+/bin/
+*.test
+*.out
+.env
+.idea/
