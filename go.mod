@@ -1,4 +1,4 @@
-module containerised-agents
+module agentbox
 
 go 1.27.0
 

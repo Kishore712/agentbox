@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"containerised-agents/internal/common"
+	"agentbox/internal/common"
 )
 
 // --- Fakes ---

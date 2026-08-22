@@ -15,7 +15,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"containerised-agents/internal/common"
+	"agentbox/internal/common"
 )
 
 var (

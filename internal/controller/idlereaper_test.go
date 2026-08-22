@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"containerised-agents/internal/common"
+	"agentbox/internal/common"
 )
 
 func TestIdleReaper_Tick_SuspendsDueInstances(t *testing.T) {

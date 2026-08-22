@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"containerised-agents/internal/hostagent"
+	"agentbox/internal/hostagent"
 )
 
 func main() {

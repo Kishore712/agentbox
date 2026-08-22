@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"containerised-agents/internal/common"
+	"agentbox/internal/common"
 )
 
 var (

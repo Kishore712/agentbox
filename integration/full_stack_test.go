@@ -12,10 +12,10 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"containerised-agents/internal/apiservice"
-	"containerised-agents/internal/common"
-	"containerised-agents/internal/controller"
-	"containerised-agents/internal/hostagent"
+	"agentbox/internal/apiservice"
+	"agentbox/internal/common"
+	"agentbox/internal/controller"
+	"agentbox/internal/hostagent"
 )
 
 const fullStackAPIKey = "full-stack-test-key"

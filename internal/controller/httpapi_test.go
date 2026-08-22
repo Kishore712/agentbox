@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"containerised-agents/internal/common"
+	"agentbox/internal/common"
 )
 
 func newTestRouter(t *testing.T, ha HostAgentClient, ib ImageBuilder) (*http.ServeMux, *Service) {

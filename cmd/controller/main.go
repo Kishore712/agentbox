@@ -17,9 +17,9 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"containerised-agents/internal/common"
-	"containerised-agents/internal/controller"
-	"containerised-agents/internal/imagebuilder"
+	"agentbox/internal/common"
+	"agentbox/internal/controller"
+	"agentbox/internal/imagebuilder"
 )
 
 func main() {

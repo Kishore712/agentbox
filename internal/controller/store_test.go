@@ -8,7 +8,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"containerised-agents/internal/common"
+	"agentbox/internal/common"
 )
 
 // newTestStore connects to a local Redis (started via `brew services start

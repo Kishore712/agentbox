@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"containerised-agents/internal/apiservice"
+	"agentbox/internal/apiservice"
 )
 
 func main() {
