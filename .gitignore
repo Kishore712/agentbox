@@ -4,3 +4,6 @@
 *.out
 .env
 .idea/
+
+# Design docs stay local until finalized/refined — not checked in yet.
+/Docs/
