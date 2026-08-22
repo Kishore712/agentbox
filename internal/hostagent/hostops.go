@@ -11,12 +11,15 @@ import (
 )
 
 // NetworkInfo is what SetupNetwork hands back: the TAP device to attach to
-// Firecracker's network-interface config, plus the guest/host IPs on the
-// /30 it just created (§4.3 step 3, §3.1 disk layout).
+// Firecracker's network-interface config, the guest/host IPs on the /30 it
+// just created (§4.3 step 3, §3.1 disk layout), and the Squid proxy address
+// the guest's init script should configure HTTP_PROXY/HTTPS_PROXY to
+// (§4.8) — empty if this HostOps implementation isn't running Squid.
 type NetworkInfo struct {
-	TapDevice string
-	GuestIP   string
-	HostIP    string
+	TapDevice      string
+	GuestIP        string
+	HostIP         string
+	SquidProxyAddr string // e.g. "172.16.0.1:3128"; empty if egress proxying isn't configured
 }
 
 // HostOps abstracts every OS-level operation the Host Agent needs — file
@@ -26,9 +29,19 @@ type NetworkInfo struct {
 // real implementation, only functional on the target GCE hosts; unit tests
 // use fakeHostOps instead (see manager_test.go).
 type HostOps interface {
+	// PrepareKernel stages the platform-owned golden kernel for this
+	// instance and returns the path value to pass to the Firecracker API's
+	// boot-source call — the real host path when unjailed, or a
+	// chroot-relative path when the Jailer is enabled (§4.6/Phase 6),
+	// since a jailed firecracker process's own filesystem view is the
+	// chroot root, not the real host filesystem.
+	PrepareKernel(ctx context.Context, goldenKernelPath, instanceID string) (kernelPathForAPI string, err error)
+
 	// CopyRootfs implements §4.3 step 1: a fresh per-instance copy of the
 	// workload's golden rootfs, since a writable root can't safely be
-	// shared across concurrent Firecracker processes.
+	// shared across concurrent Firecracker processes. Returns the path
+	// value to pass to the Firecracker API, same host-vs-jail-relative
+	// distinction as PrepareKernel.
 	CopyRootfs(ctx context.Context, goldenRootfsPath, instanceID string) (instanceRootfsPath string, err error)
 
 	// CreateHomeVolume implements §4.3 step 2: a fresh, empty, sized ext4
@@ -92,26 +105,87 @@ type LinuxHostOps struct {
 	DataDir           string // e.g. "/data"
 	FirecrackerBinary string // e.g. "/usr/local/bin/firecracker"
 	HomeVolumeSizeMiB int
+	Subnets           *SubnetAllocator // required — see NewLinuxHostOps
+	Squid             *SquidManager    // nil disables egress proxying entirely (no ACLs applied, traffic still locked to the (unused) squid port and thus effectively blocked — see SetupNetwork)
+	SquidPort         int              // 0 defaults to DefaultSquidPort
+	Jailer            *JailerConfig    // nil (or Enabled: false) runs a bare firecracker process instead
 }
 
-func (h *LinuxHostOps) instanceDir(instanceID string) string {
+// NewLinuxHostOps constructs a LinuxHostOps with its subnet pool
+// initialized — the zero value is missing Subnets and would panic on first
+// use, so this is the intended constructor. Squid is wired in separately
+// (set the Squid field directly) since it's optional.
+func NewLinuxHostOps(dataDir, firecrackerBinary string, homeVolumeSizeMiB int, subnetBaseCIDR string, subnetPoolSize int) (*LinuxHostOps, error) {
+	subnets, err := NewSubnetAllocator(subnetBaseCIDR, subnetPoolSize)
+	if err != nil {
+		return nil, fmt.Errorf("init subnet allocator: %w", err)
+	}
+	return &LinuxHostOps{
+		DataDir: dataDir, FirecrackerBinary: firecrackerBinary,
+		HomeVolumeSizeMiB: homeVolumeSizeMiB, Subnets: subnets,
+	}, nil
+}
+
+func (h *LinuxHostOps) jailerEnabled() bool {
+	return h.Jailer != nil && h.Jailer.Enabled
+}
+
+// instanceRootDir is the host-visible directory holding everything for one
+// instance. When the Jailer is enabled, this IS the chroot root itself
+// (jailer's documented convention, see jailChrootRoot) — placing files
+// there directly is how they become visible to the chrooted firecracker
+// process, no separate copy-into-chroot step needed.
+func (h *LinuxHostOps) instanceRootDir(instanceID string) string {
+	if h.jailerEnabled() {
+		return jailChrootRoot(h.Jailer.ChrootBaseDir, h.FirecrackerBinary, instanceID)
+	}
 	return filepath.Join(h.DataDir, "instances", instanceID)
 }
 
-func (h *LinuxHostOps) CopyRootfs(ctx context.Context, goldenRootfsPath, instanceID string) (string, error) {
-	dir := h.instanceDir(instanceID)
+// apiPath is the value to pass to the Firecracker API for a file named
+// filename in this instance's root dir. Unjailed, Firecracker sees the
+// real host filesystem, so this is the real absolute path. Jailed,
+// firecracker's own "/" IS instanceRootDir (jailer chroots it there before
+// exec), so the correct API value is the absolute path *from inside that
+// view* — i.e. just "/" + filename, never the host-side path.
+func (h *LinuxHostOps) apiPath(instanceID, filename string) string {
+	if h.jailerEnabled() {
+		return "/" + filename
+	}
+	return filepath.Join(h.instanceRootDir(instanceID), filename)
+}
+
+func (h *LinuxHostOps) PrepareKernel(ctx context.Context, goldenKernelPath, instanceID string) (string, error) {
+	dir := h.instanceRootDir(instanceID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("mkdir instance dir: %w", err)
+		return "", fmt.Errorf("mkdir instance root dir: %w", err)
+	}
+	if !h.jailerEnabled() {
+		// Unjailed: firecracker reads the golden kernel directly, no need
+		// to duplicate it per instance.
+		return goldenKernelPath, nil
+	}
+	dst := filepath.Join(dir, "vmlinux")
+	if err := copyFile(goldenKernelPath, dst); err != nil {
+		return "", fmt.Errorf("stage kernel into chroot: %w", err)
+	}
+	return h.apiPath(instanceID, "vmlinux"), nil
+}
+
+func (h *LinuxHostOps) CopyRootfs(ctx context.Context, goldenRootfsPath, instanceID string) (string, error) {
+	dir := h.instanceRootDir(instanceID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir instance root dir: %w", err)
 	}
 	dst := filepath.Join(dir, "rootfs.ext4")
 	if err := copyFile(goldenRootfsPath, dst); err != nil {
 		return "", fmt.Errorf("copy rootfs: %w", err)
 	}
-	return dst, nil
+	return h.apiPath(instanceID, "rootfs.ext4"), nil
 }
 
 func (h *LinuxHostOps) CreateHomeVolume(ctx context.Context, instanceID string) (string, error) {
-	dst := filepath.Join(h.instanceDir(instanceID), "home.ext4")
+	dst := filepath.Join(h.instanceRootDir(instanceID), "home.ext4")
 	sizeMiB := h.HomeVolumeSizeMiB
 	if sizeMiB == 0 {
 		sizeMiB = 1024
@@ -122,12 +196,22 @@ func (h *LinuxHostOps) CreateHomeVolume(ctx context.Context, instanceID string) 
 	if err := runCmd(ctx, "mkfs.ext4", "-q", dst); err != nil {
 		return "", fmt.Errorf("format home.ext4: %w", err)
 	}
-	return dst, nil
+	return h.apiPath(instanceID, "home.ext4"), nil
+}
+
+func (h *LinuxHostOps) squidPort() int {
+	if h.SquidPort != 0 {
+		return h.SquidPort
+	}
+	return DefaultSquidPort
 }
 
 func (h *LinuxHostOps) SetupNetwork(ctx context.Context, instanceID string, egressAllowlist []string) (NetworkInfo, error) {
 	tap := tapDeviceName(instanceID)
-	hostIP, guestIP := subnetFor(instanceID)
+	hostIP, guestIP, err := h.Subnets.Allocate(instanceID)
+	if err != nil {
+		return NetworkInfo{}, fmt.Errorf("allocate subnet: %w", err)
+	}
 
 	if err := runCmd(ctx, "ip", "tuntap", "add", "dev", tap, "mode", "tap"); err != nil {
 		return NetworkInfo{}, fmt.Errorf("create tap device: %w", err)
@@ -138,24 +222,46 @@ func (h *LinuxHostOps) SetupNetwork(ctx context.Context, instanceID string, egre
 	if err := runCmd(ctx, "ip", "link", "set", tap, "up"); err != nil {
 		return NetworkInfo{}, fmt.Errorf("bring up tap device: %w", err)
 	}
-	// Egress filtering: restrict this instance's FORWARD traffic to the
-	// allowlist (§4.8). A real implementation would resolve allowlist
-	// entries and/or route through the Squid proxy; left as a direct
-	// per-destination iptables rule set here for the prototype.
-	for _, dest := range egressAllowlist {
-		if err := runCmd(ctx, "iptables", "-A", "FORWARD", "-i", tap, "-d", dest, "-j", "ACCEPT"); err != nil {
-			return NetworkInfo{}, fmt.Errorf("apply egress rule for %s: %w", dest, err)
-		}
+
+	// Egress filtering (§4.8): Squid is the sole enforcement point for the
+	// allowlist, via per-instance ACLs (applied below). iptables' only job
+	// is to prevent bypass — this TAP's forwarded traffic may reach ONLY
+	// the host's Squid port, nothing else, regardless of what the guest
+	// tries to connect to directly.
+	port := h.squidPort()
+	if err := runCmd(ctx, "iptables", "-A", "FORWARD", "-i", tap, "-d", hostIP, "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT"); err != nil {
+		return NetworkInfo{}, fmt.Errorf("allow squid-bound traffic: %w", err)
 	}
 	if err := runCmd(ctx, "iptables", "-A", "FORWARD", "-i", tap, "-j", "DROP"); err != nil {
 		return NetworkInfo{}, fmt.Errorf("apply default-deny egress rule: %w", err)
 	}
 
-	return NetworkInfo{TapDevice: tap, GuestIP: guestIP, HostIP: hostIP}, nil
+	if h.Squid != nil {
+		if err := h.Squid.ApplyACL(ctx, instanceID, guestIP, egressAllowlist); err != nil {
+			return NetworkInfo{}, fmt.Errorf("apply squid ACL: %w", err)
+		}
+	}
+
+	return NetworkInfo{
+		TapDevice: tap, GuestIP: guestIP, HostIP: hostIP,
+		SquidProxyAddr: fmt.Sprintf("%s:%d", hostIP, port),
+	}, nil
 }
 
 func (h *LinuxHostOps) TeardownNetwork(ctx context.Context, instanceID string) error {
 	tap := tapDeviceName(instanceID)
+	hostIP, _, _ := h.Subnets.Lookup(instanceID) // read before releasing, to remove the matching iptables rule below
+	h.Subnets.Release(instanceID)
+
+	if h.Squid != nil {
+		if err := h.Squid.RemoveACL(ctx, instanceID); err != nil {
+			// Best-effort — a Squid reload hiccup shouldn't block tearing
+			// down the TAP device and reclaiming the subnet.
+			_ = err
+		}
+	}
+	port := h.squidPort()
+	_ = runCmd(ctx, "iptables", "-D", "FORWARD", "-i", tap, "-d", hostIP, "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT")
 	_ = runCmd(ctx, "iptables", "-D", "FORWARD", "-i", tap, "-j", "DROP") // best-effort; may already be gone
 	if err := runCmd(ctx, "ip", "link", "delete", tap); err != nil {
 		return fmt.Errorf("delete tap device: %w", err)
@@ -163,8 +269,13 @@ func (h *LinuxHostOps) TeardownNetwork(ctx context.Context, instanceID string) e
 	return nil
 }
 
+// SocketPath is always the host-visible location — this is Host Agent's
+// own bookkeeping (where it dials in from outside to talk to Firecracker's
+// API), not a value passed to the Firecracker API itself, so it's never
+// jail-relative even when jailing is enabled. Unified to a fixed filename
+// inside instanceRootDir, whether jailed or not.
 func (h *LinuxHostOps) SocketPath(instanceID string) string {
-	return filepath.Join("/run/firecracker", instanceID+".socket")
+	return filepath.Join(h.instanceRootDir(instanceID), "api.sock")
 }
 
 func (h *LinuxHostOps) StartFirecrackerProcess(ctx context.Context, instanceID string) (string, error) {
@@ -173,6 +284,20 @@ func (h *LinuxHostOps) StartFirecrackerProcess(ctx context.Context, instanceID s
 		return "", err
 	}
 	_ = os.Remove(sock) // stale socket from a previous run
+
+	if h.jailerEnabled() {
+		// The jailer chroots the process before exec'ing it, so the
+		// --api-sock value passed to firecracker (after the "--"
+		// separator) must be relative to that view, not the host path —
+		// see JailerConfig's caveat about this being unverified.
+		name, args := buildJailerCommand(*h.Jailer, h.FirecrackerBinary, instanceID, "api.sock")
+		cmd := exec.CommandContext(context.WithoutCancel(ctx), name, args...)
+		if err := cmd.Start(); err != nil {
+			return "", fmt.Errorf("start jailed firecracker process: %w", err)
+		}
+		return sock, nil
+	}
+
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), h.FirecrackerBinary, "--api-sock", sock)
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("start firecracker process: %w", err)
@@ -184,23 +309,31 @@ func (h *LinuxHostOps) StartFirecrackerProcess(ctx context.Context, instanceID s
 }
 
 func (h *LinuxHostOps) StopFirecrackerProcess(ctx context.Context, instanceID string) error {
-	// Best-effort: find and kill by matching the socket path in the
-	// process's argv, since we don't retain a live *exec.Cmd handle.
-	sock := h.SocketPath(instanceID)
-	return runCmd(ctx, "pkill", "-f", "firecracker --api-sock "+sock)
+	// Best-effort: find and kill by matching the instance id in the
+	// process's argv, since we don't retain a live *exec.Cmd handle. Jailer
+	// invocations carry --id <instanceID>; bare firecracker invocations
+	// carry the (also instance-specific) socket path — either pattern
+	// uniquely identifies the right process.
+	if h.jailerEnabled() {
+		return runCmd(ctx, "pkill", "-f", "--id "+instanceID)
+	}
+	return runCmd(ctx, "pkill", "-f", "firecracker --api-sock "+h.SocketPath(instanceID))
 }
 
 func (h *LinuxHostOps) SnapshotPaths(instanceID string) (string, string) {
-	dir := filepath.Join(h.instanceDir(instanceID), "snapshot")
-	return filepath.Join(dir, "vmstate"), filepath.Join(dir, "mem_file")
+	// Kept under a snapshot/ subdirectory (not flattened into
+	// instanceRootDir directly) to stay consistent with the disk layout
+	// documented in §3.1/§4.7, jailed or not.
+	return h.apiPath(instanceID, "snapshot/vmstate"), h.apiPath(instanceID, "snapshot/mem_file")
 }
 
 func (h *LinuxHostOps) metadataPath(instanceID string) string {
-	return filepath.Join(h.instanceDir(instanceID), "metadata.json")
+	// Host Agent's own bookkeeping, like SocketPath — never jail-relative.
+	return filepath.Join(h.instanceRootDir(instanceID), "metadata.json")
 }
 
 func (h *LinuxHostOps) SaveInstanceMetadata(ctx context.Context, instanceID string, meta InstanceMetadata) error {
-	dir := h.instanceDir(instanceID)
+	dir := h.instanceRootDir(instanceID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -224,7 +357,7 @@ func (h *LinuxHostOps) LoadInstanceMetadata(ctx context.Context, instanceID stri
 }
 
 func (h *LinuxHostOps) DeleteInstanceFiles(ctx context.Context, instanceID string) error {
-	return os.RemoveAll(h.instanceDir(instanceID))
+	return os.RemoveAll(h.instanceRootDir(instanceID))
 }
 
 func copyFile(src, dst string) error {
@@ -251,19 +384,14 @@ func runCmd(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
-// tapDeviceName and subnetFor are deliberately simple placeholders — a real
-// deployment needs a collision-free subnet allocator across all instances
-// on a host (§8 open item), not a hash-based derivation. Good enough to
-// keep the interface shape honest for now.
+// tapDeviceName derives a short, deterministic device name from the
+// instance ID. Collision-resistant enough for a prototype (32-bit hash
+// space) — subnet allocation was the piece that needed a real stateful
+// allocator (SubnetAllocator, subnet.go), since the old placeholder there
+// returned the identical IP for every instance, a guaranteed collision
+// rather than a low-probability one.
 func tapDeviceName(instanceID string) string {
 	return "tap-" + shortHash(instanceID)
-}
-
-func subnetFor(instanceID string) (hostIP, guestIP string) {
-	// Placeholder allocation — see the TODO above. Real implementation
-	// needs a stateful allocator to avoid collisions across concurrent
-	// instances on the same host.
-	return "172.16.0.1", "172.16.0.2"
 }
 
 func shortHash(s string) string {

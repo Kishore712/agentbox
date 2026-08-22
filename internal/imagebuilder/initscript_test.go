@@ -42,6 +42,31 @@ func TestBuildInitScript_ShellQuotingEscapesEmbeddedQuotes(t *testing.T) {
 	}
 }
 
+func TestBuildInitScript_ConfiguresProxyFromCmdline(t *testing.T) {
+	script, err := BuildInitScript([]string{"app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(script, "/proc/cmdline") {
+		t.Errorf("expected the script to read the proxy address from /proc/cmdline, script:\n%s", script)
+	}
+	if !strings.Contains(script, "platform\\.squid_proxy=") {
+		t.Errorf("expected the script to parse platform.squid_proxy=, script:\n%s", script)
+	}
+	for _, want := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("expected the script to export %s, script:\n%s", want, script)
+		}
+	}
+	// The proxy setup must happen before exec, not after (an exec replaces
+	// the process — anything after it never runs).
+	proxyIdx := strings.Index(script, "SQUID_PROXY=")
+	execIdx := strings.Index(script, "exec ")
+	if proxyIdx == -1 || execIdx == -1 || proxyIdx > execIdx {
+		t.Errorf("proxy setup must come before exec, script:\n%s", script)
+	}
+}
+
 func TestBuildInitScript_NetworkingNotGuestSideResponsibility(t *testing.T) {
 	// Regression guard for a design decision: the kernel's own ip= boot
 	// argument handles networking (§4.3) — init must NOT contain any

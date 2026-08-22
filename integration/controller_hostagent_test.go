@@ -39,6 +39,9 @@ func newStubHostOps() *stubHostOps {
 	return &stubHostOps{metadata: map[string]hostagent.InstanceMetadata{}}
 }
 
+func (s *stubHostOps) PrepareKernel(ctx context.Context, goldenKernelPath, instanceID string) (string, error) {
+	return goldenKernelPath, nil
+}
 func (s *stubHostOps) CopyRootfs(ctx context.Context, goldenRootfsPath, instanceID string) (string, error) {
 	return "/data/instances/" + instanceID + "/rootfs.ext4", nil
 }

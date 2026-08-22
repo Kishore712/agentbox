@@ -25,10 +25,36 @@ func main() {
 	kernelImagePath := envOr("KERNEL_IMAGE_PATH", "/data/vmlinux")
 	guestPort := envIntOr("GUEST_PORT", 8080)
 	bootTimeout := envDurationOr("BOOT_TIMEOUT", 10*time.Second)
+	subnetBaseCIDR := envOr("SUBNET_BASE_CIDR", "172.16.0.0/16")
+	subnetPoolSize := envIntOr("SUBNET_POOL_SIZE", 1024)
+	squidConfDir := os.Getenv("SQUID_CONF_DIR") // e.g. "/etc/squid/conf.d" — unset disables egress proxying
+	squidPort := envIntOr("SQUID_PORT", hostagent.DefaultSquidPort)
+	jailerEnabled := os.Getenv("JAILER_ENABLED") == "true"
+	jailerBinary := envOr("JAILER_BINARY", "/usr/local/bin/jailer")
+	jailerChrootBaseDir := envOr("JAILER_CHROOT_BASE_DIR", "/srv/jailer")
+	jailerUID := envIntOr("JAILER_UID", 0)
+	jailerGID := envIntOr("JAILER_GID", 0)
 
-	ops := &hostagent.LinuxHostOps{
-		DataDir:           dataDir,
-		FirecrackerBinary: firecrackerBinary,
+	ops, err := hostagent.NewLinuxHostOps(dataDir, firecrackerBinary, 0, subnetBaseCIDR, subnetPoolSize)
+	if err != nil {
+		log.Fatalf("init host ops: %v", err)
+	}
+	if squidConfDir != "" {
+		ops.Squid = &hostagent.SquidManager{ConfDir: squidConfDir}
+		ops.SquidPort = squidPort
+	} else {
+		log.Print("SQUID_CONF_DIR not set — egress proxying disabled; instances will have no outbound network access at all (§4.8: iptables locks TAP traffic to the squid port regardless, and with no Squid ACLs applied nothing reaches it)")
+	}
+	if jailerEnabled {
+		if jailerUID == 0 || jailerGID == 0 {
+			log.Print("WARNING: JAILER_ENABLED=true but JAILER_UID/JAILER_GID are unset (defaulting to 0/root) — the whole point of the Jailer is dropping root privilege, running it as root defeats that (§4.6/Phase 6)")
+		}
+		ops.Jailer = &hostagent.JailerConfig{
+			Enabled: true, JailerBinary: jailerBinary, ChrootBaseDir: jailerChrootBaseDir,
+			UID: jailerUID, GID: jailerGID,
+		}
+		log.Printf("jailer enabled: binary=%s chroot_base=%s uid=%d gid=%d (unverified against a real jailer binary — see JailerConfig's doc comment)",
+			jailerBinary, jailerChrootBaseDir, jailerUID, jailerGID)
 	}
 	mgr := hostagent.NewVMManager(
 		ops,

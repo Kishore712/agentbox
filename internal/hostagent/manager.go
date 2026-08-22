@@ -55,8 +55,14 @@ func NewVMManager(ops HostOps, fcFactory func(string) FirecrackerClient, readine
 	return &VMManager{ops: ops, fcFactory: fcFactory, readiness: readiness, cfg: cfg}
 }
 
-// BootVM implements §4.3 "Flow — Boot a microVM", steps 1-7.
+// BootVM implements §4.3 "Flow — Boot a microVM", steps 1-7 (kernel staging
+// folded in ahead of step 1 — see PrepareKernel's doc comment on HostOps
+// for why this needs to happen per-instance when jailing is enabled).
 func (m *VMManager) BootVM(ctx context.Context, req BootRequest) (VMEndpoint, error) {
+	kernelPath, err := m.ops.PrepareKernel(ctx, m.cfg.KernelImagePath, req.InstanceID)
+	if err != nil {
+		return VMEndpoint{}, fmt.Errorf("prepare kernel: %w", err)
+	}
 	rootfsPath, err := m.ops.CopyRootfs(ctx, req.RootfsRef, req.InstanceID) // step 1
 	if err != nil {
 		return VMEndpoint{}, fmt.Errorf("copy rootfs: %w", err)
@@ -79,7 +85,7 @@ func (m *VMManager) BootVM(ctx context.Context, req BootRequest) (VMEndpoint, er
 	}
 	fc := m.fcFactory(sock)
 
-	if err := m.configureAndStart(ctx, fc, net, rootfsPath, homePath, req.VCPUs, req.MemoryMiB); err != nil { // step 5
+	if err := m.configureAndStart(ctx, fc, net, kernelPath, rootfsPath, homePath, req.VCPUs, req.MemoryMiB); err != nil { // step 5
 		return VMEndpoint{}, err
 	}
 
@@ -93,10 +99,19 @@ func (m *VMManager) BootVM(ctx context.Context, req BootRequest) (VMEndpoint, er
 // configureAndStart implements §4.3 step 5's ordered PUT sequence: boot
 // source (with a kernel `ip=` argument so the guest gets a static network
 // config with zero guest-side cooperation, §4.3), rootfs drive, home drive,
-// network interface, machine config, then InstanceStart.
-func (m *VMManager) configureAndStart(ctx context.Context, fc FirecrackerClient, net NetworkInfo, rootfsPath, homePath string, vcpus, memoryMiB int) error {
+// network interface, machine config, then InstanceStart. kernelPath is
+// whatever PrepareKernel resolved it to — the real host path unjailed, or a
+// chroot-relative path when jailed.
+func (m *VMManager) configureAndStart(ctx context.Context, fc FirecrackerClient, net NetworkInfo, kernelPath, rootfsPath, homePath string, vcpus, memoryMiB int) error {
 	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off ip=%s::%s:255.255.255.252::eth0:off", net.GuestIP, net.HostIP)
-	if err := fc.SetBootSource(ctx, m.cfg.KernelImagePath, bootArgs); err != nil {
+	if net.SquidProxyAddr != "" {
+		// Read by the generated init script (§4.6) via /proc/cmdline — the
+		// Squid address depends on this instance's subnet allocation,
+		// decided at boot time, so it can't be baked into the image at
+		// build time the way the entrypoint itself is.
+		bootArgs += " platform.squid_proxy=" + net.SquidProxyAddr
+	}
+	if err := fc.SetBootSource(ctx, kernelPath, bootArgs); err != nil {
 		return fmt.Errorf("set boot source: %w", err)
 	}
 	if err := fc.SetDrive(ctx, "rootfs", rootfsPath, true, false); err != nil {

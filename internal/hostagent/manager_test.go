@@ -3,6 +3,7 @@ package hostagent
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,21 +14,23 @@ import (
 type fakeHostOps struct {
 	mu sync.Mutex
 
-	copyRootfsErr    error
-	createHomeErr    error
-	setupNetworkErr  error
-	startProcessErr  error
-	stopProcessErr   error
-	saveMetadataErr  error
-	loadMetadataErr  error
-	deleteFilesErr   error
-	teardownNetErr   error
-	nextGuestIP      string
-	nextHostIP       string
-	metadata         map[string]InstanceMetadata
-	deletedInstances map[string]bool
-	stoppedProcesses map[string]bool
-	torndownNetworks map[string]bool
+	prepareKernelErr   error
+	copyRootfsErr      error
+	createHomeErr      error
+	setupNetworkErr    error
+	startProcessErr    error
+	stopProcessErr     error
+	saveMetadataErr    error
+	loadMetadataErr    error
+	deleteFilesErr     error
+	teardownNetErr     error
+	nextGuestIP        string
+	nextHostIP         string
+	nextSquidProxyAddr string
+	metadata           map[string]InstanceMetadata
+	deletedInstances   map[string]bool
+	stoppedProcesses   map[string]bool
+	torndownNetworks   map[string]bool
 }
 
 func newFakeHostOps() *fakeHostOps {
@@ -39,6 +42,13 @@ func newFakeHostOps() *fakeHostOps {
 		stoppedProcesses: map[string]bool{},
 		torndownNetworks: map[string]bool{},
 	}
+}
+
+func (f *fakeHostOps) PrepareKernel(ctx context.Context, goldenKernelPath, instanceID string) (string, error) {
+	if f.prepareKernelErr != nil {
+		return "", f.prepareKernelErr
+	}
+	return goldenKernelPath, nil
 }
 
 func (f *fakeHostOps) CopyRootfs(ctx context.Context, goldenRootfsPath, instanceID string) (string, error) {
@@ -59,7 +69,10 @@ func (f *fakeHostOps) SetupNetwork(ctx context.Context, instanceID string, egres
 	if f.setupNetworkErr != nil {
 		return NetworkInfo{}, f.setupNetworkErr
 	}
-	return NetworkInfo{TapDevice: "tap-" + instanceID, GuestIP: f.nextGuestIP, HostIP: f.nextHostIP}, nil
+	return NetworkInfo{
+		TapDevice: "tap-" + instanceID, GuestIP: f.nextGuestIP, HostIP: f.nextHostIP,
+		SquidProxyAddr: f.nextSquidProxyAddr,
+	}, nil
 }
 
 func (f *fakeHostOps) TeardownNetwork(ctx context.Context, instanceID string) error {
@@ -138,17 +151,19 @@ type fakeFirecrackerClient struct {
 	createSnapshotErr error
 	loadSnapshotErr   error
 
-	bootArgs     string
-	drivesSet    []string
-	instanceUp   bool
-	paused       bool
-	snapshotted  bool
-	snapshotLoad bool
+	bootSourcePath string
+	bootArgs       string
+	drivesSet      []string
+	instanceUp     bool
+	paused         bool
+	snapshotted    bool
+	snapshotLoad   bool
 }
 
 func (f *fakeFirecrackerClient) SetBootSource(ctx context.Context, kernelImagePath, bootArgs string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.bootSourcePath = kernelImagePath
 	f.bootArgs = bootArgs
 	return f.setBootSourceErr
 }
@@ -245,6 +260,66 @@ func TestBootVM_Success(t *testing.T) {
 	if len(meta.EgressAllowlist) != 1 || meta.EgressAllowlist[0] != "api.openai.com" {
 		t.Errorf("saved metadata = %+v", meta)
 	}
+}
+
+func TestBootVM_IncludesSquidProxyInBootArgsWhenPresent(t *testing.T) {
+	ops := newFakeHostOps()
+	ops.nextSquidProxyAddr = "172.16.0.1:3128"
+	fc := &fakeFirecrackerClient{}
+	m := newTestManager(ops, fc, &fakeReadiness{})
+
+	if _, err := m.BootVM(context.Background(), BootRequest{InstanceID: "wl_x:agent:abc"}); err != nil {
+		t.Fatalf("BootVM: %v", err)
+	}
+	if !strings.Contains(fc.bootArgs, "platform.squid_proxy=172.16.0.1:3128") {
+		t.Errorf("boot_args = %q, want it to include the squid proxy address", fc.bootArgs)
+	}
+}
+
+func TestBootVM_OmitsSquidProxyArgWhenAbsent(t *testing.T) {
+	ops := newFakeHostOps() // nextSquidProxyAddr left at its zero value ""
+	fc := &fakeFirecrackerClient{}
+	m := newTestManager(ops, fc, &fakeReadiness{})
+
+	if _, err := m.BootVM(context.Background(), BootRequest{InstanceID: "wl_x:agent:abc"}); err != nil {
+		t.Fatalf("BootVM: %v", err)
+	}
+	if strings.Contains(fc.bootArgs, "squid_proxy") {
+		t.Errorf("boot_args = %q, should not mention squid_proxy when HostOps didn't set one", fc.bootArgs)
+	}
+}
+
+func TestBootVM_UsesPrepareKernelResultNotRawConfigPath(t *testing.T) {
+	ops := &fakeHostOpsWithKernelOverride{fakeHostOps: newFakeHostOps(), kernelPath: "/jail/root/wl_x/vmlinux"}
+	fc := &fakeFirecrackerClient{}
+	m := newTestManager(ops, fc, &fakeReadiness{}) // Config.KernelImagePath = "/data/vmlinux"
+
+	if _, err := m.BootVM(context.Background(), BootRequest{InstanceID: "wl_x:agent:abc"}); err != nil {
+		t.Fatalf("BootVM: %v", err)
+	}
+	if fc.bootSourcePath != "/jail/root/wl_x/vmlinux" {
+		t.Errorf("boot source path = %q, want the value PrepareKernel returned, not the raw Config.KernelImagePath", fc.bootSourcePath)
+	}
+}
+
+func TestBootVM_PrepareKernelFailure(t *testing.T) {
+	ops := newFakeHostOps()
+	ops.prepareKernelErr = errors.New("chroot not writable")
+	m := newTestManager(ops, &fakeFirecrackerClient{}, &fakeReadiness{})
+	if _, err := m.BootVM(context.Background(), BootRequest{InstanceID: "x"}); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+// fakeHostOpsWithKernelOverride lets a test control PrepareKernel's return
+// value independently of the other fakeHostOps fields.
+type fakeHostOpsWithKernelOverride struct {
+	*fakeHostOps
+	kernelPath string
+}
+
+func (f *fakeHostOpsWithKernelOverride) PrepareKernel(ctx context.Context, goldenKernelPath, instanceID string) (string, error) {
+	return f.kernelPath, nil
 }
 
 func TestBootVM_RootfsCopyFailure(t *testing.T) {
