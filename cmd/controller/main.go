@@ -19,6 +19,7 @@ import (
 
 	"containerised-agents/internal/common"
 	"containerised-agents/internal/controller"
+	"containerised-agents/internal/imagebuilder"
 )
 
 func main() {
@@ -41,11 +42,13 @@ func main() {
 	tokens := controller.NewTokenIssuer([]byte(tokenSecret))
 	ha := controller.NewHTTPHostAgentClient()
 
-	// Image Builder (Phase 2 of the implementation plan) isn't built yet —
-	// this stub lets the Controller run end-to-end for everything except
-	// actually producing a bootable rootfs. Every workload registered
-	// against this binary will sit in PROVISIONING until Phase 2 lands.
-	ib := &notImplementedImageBuilder{}
+	// Image Builder (§4.6, Phase 2): real Docker/ext4 pipeline. Only
+	// functional where Docker and Linux mount privileges actually exist —
+	// not this dev machine, but the orchestration is fully unit-tested
+	// against fakes (internal/imagebuilder).
+	ibCfg := imagebuilder.DefaultConfig()
+	ibCfg.DataDir = envOr("DATA_DIR", "/data")
+	ib := imagebuilder.NewBuilder(imagebuilder.CLIDockerOps{}, imagebuilder.LinuxFilesystemOps{}, ibCfg)
 
 	svc := controller.NewService(store, ha, tokens, ib)
 
@@ -70,20 +73,6 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 }
-
-// notImplementedImageBuilder is a placeholder for Phase 2 (Docker image →
-// rootfs pipeline, §4.6), not yet implemented.
-type notImplementedImageBuilder struct{}
-
-func (notImplementedImageBuilder) Build(ctx context.Context, workloadID, imageRef string) (string, error) {
-	return "", errWorkloadBuildNotImplemented
-}
-
-var errWorkloadBuildNotImplemented = &notImplementedError{"image builder not implemented yet (Phase 2)"}
-
-type notImplementedError struct{ msg string }
-
-func (e *notImplementedError) Error() string { return e.msg }
 
 // seedHostsFromEnv registers the static Host Agent list (§4.2: "seeded from
 // static config at startup, no dynamic host auto-registration in v1").
