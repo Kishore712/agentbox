@@ -7,3 +7,13 @@
 
 # Design docs stay local until finalized/refined — not checked in yet.
 /Docs/
+
+# Terraform state carries real resource IDs/IPs — never check in, and never
+# share across machines by hand (use a remote backend for that instead).
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
