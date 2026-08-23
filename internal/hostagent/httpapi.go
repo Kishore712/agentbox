@@ -3,6 +3,7 @@ package hostagent
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 )
 
@@ -32,6 +33,15 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// writeInternalError logs the real error server-side and returns a generic
+// message to the caller — an unclassified failure here can carry host
+// filesystem paths, TAP device names, or Firecracker socket errors that
+// shouldn't leak to whoever's calling this endpoint (the Controller).
+func writeInternalError(w http.ResponseWriter, r *http.Request, op string, err error) {
+	slog.Error("request failed", "op", op, "method", r.Method, "path", r.URL.Path, "error", err)
+	writeError(w, http.StatusInternalServerError, "internal error")
+}
+
 type bootVMRequest struct {
 	InstanceID      string   `json:"instance_id"`
 	RootfsRef       string   `json:"rootfs_ref"`
@@ -54,7 +64,7 @@ func (h *httpHandlers) bootVM(w http.ResponseWriter, r *http.Request) {
 		EgressAllowlist: req.EgressAllowlist,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "boot_vm", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"guest_ip": ep.GuestIP, "guest_port": ep.GuestPort})
@@ -62,7 +72,7 @@ func (h *httpHandlers) bootVM(w http.ResponseWriter, r *http.Request) {
 
 func (h *httpHandlers) suspendVM(w http.ResponseWriter, r *http.Request) {
 	if err := h.mgr.SuspendVM(r.Context(), r.PathValue("id")); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "suspend_vm", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{})
@@ -75,7 +85,7 @@ func (h *httpHandlers) resumeVM(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "resume_vm", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"guest_ip": ep.GuestIP, "guest_port": ep.GuestPort})
@@ -83,7 +93,7 @@ func (h *httpHandlers) resumeVM(w http.ResponseWriter, r *http.Request) {
 
 func (h *httpHandlers) deleteVM(w http.ResponseWriter, r *http.Request) {
 	if err := h.mgr.DeleteVM(r.Context(), r.PathValue("id")); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "delete_vm", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

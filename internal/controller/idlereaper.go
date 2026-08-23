@@ -2,7 +2,7 @@ package controller
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 )
 
@@ -41,12 +41,15 @@ func (r *IdleReaper) Run(ctx context.Context) {
 func (r *IdleReaper) Tick(ctx context.Context) {
 	due, err := r.svc.store.DueInstances(ctx)
 	if err != nil {
-		log.Printf("idle reaper: DueInstances: %v", err)
+		slog.Error("idle reaper: failed to list due instances", "error", err)
 		return
+	}
+	if len(due) > 0 {
+		slog.Debug("idle reaper: suspending due instances", "count", len(due))
 	}
 	for _, instanceID := range due {
 		if err := r.svc.SuspendInstance(ctx, instanceID); err != nil {
-			log.Printf("idle reaper: SuspendInstance(%s): %v", instanceID, err)
+			slog.Error("idle reaper: failed to suspend instance", "instance_id", instanceID, "error", err)
 		}
 	}
 }

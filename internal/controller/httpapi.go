@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 )
 
@@ -39,6 +40,16 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// writeInternalError logs the real error server-side (with the context
+// needed to actually debug it) and returns a generic message to the HTTP
+// caller. Callers should never send a raw err.Error() to the client for an
+// unclassified failure — it can leak internal details (Redis keys, host
+// addresses, file paths) and callers can't act on it anyway.
+func writeInternalError(w http.ResponseWriter, r *http.Request, op string, err error) {
+	slog.Error("request failed", "op", op, "method", r.Method, "path", r.URL.Path, "error", err)
+	writeError(w, http.StatusInternalServerError, "internal error")
+}
+
 // --- Workload handlers ---
 
 type createWorkloadRequest struct {
@@ -67,7 +78,7 @@ func (h *httpHandlers) createWorkload(w http.ResponseWriter, r *http.Request) {
 		MaxConcurrentInstances: req.MaxConcurrentInstances,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "create_workload", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -84,7 +95,7 @@ func (h *httpHandlers) getWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "get_workload", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -103,7 +114,7 @@ func (h *httpHandlers) getWorkload(w http.ResponseWriter, r *http.Request) {
 
 func (h *httpHandlers) deleteWorkload(w http.ResponseWriter, r *http.Request) {
 	if err := h.svc.DeleteWorkload(r.Context(), r.PathValue("id")); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "delete_workload", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "deleting"})
@@ -138,7 +149,7 @@ func (h *httpHandlers) createInstance(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, ErrAtCapacity):
 			writeError(w, http.StatusTooManyRequests, "max_concurrent_instances reached")
 		default:
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeInternalError(w, r, "create_instance", err)
 		}
 		return
 	}
@@ -152,7 +163,7 @@ func (h *httpHandlers) getInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "get_instance", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -172,7 +183,7 @@ func (h *httpHandlers) resumeInstance(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "unknown instance")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "resume_instance", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, instanceResultJSON(res))
@@ -184,7 +195,7 @@ func (h *httpHandlers) suspendInstance(w http.ResponseWriter, r *http.Request) {
 	// directly, in-process (§4.2). Exposed over HTTP anyway for
 	// completeness/ops tooling.
 	if err := h.svc.SuspendInstance(r.Context(), r.PathValue("id")); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "suspend_instance", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "suspending"})
@@ -197,7 +208,7 @@ func (h *httpHandlers) heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "heartbeat", err)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -205,7 +216,7 @@ func (h *httpHandlers) heartbeat(w http.ResponseWriter, r *http.Request) {
 
 func (h *httpHandlers) deleteInstance(w http.ResponseWriter, r *http.Request) {
 	if err := h.svc.DeleteInstance(r.Context(), r.PathValue("id")); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, r, "delete_instance", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "deleting"})

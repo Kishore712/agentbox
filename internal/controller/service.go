@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -96,14 +96,14 @@ func (svc *Service) runImageBuild(workloadID, imageRef string) {
 	ctx := context.Background()
 	rootfsRef, err := svc.ib.Build(ctx, workloadID, imageRef)
 	if err != nil {
-		log.Printf("workload %s: image build failed: %v", workloadID, err)
+		slog.Error("image build failed", "workload_id", workloadID, "image_ref", imageRef, "error", err)
 		if serr := svc.store.SetWorkloadBuildResult(ctx, workloadID, common.WorkloadFailed, ""); serr != nil {
-			log.Printf("workload %s: failed to record build failure: %v", workloadID, serr)
+			slog.Error("failed to record workload build failure", "workload_id", workloadID, "error", serr)
 		}
 		return
 	}
 	if err := svc.store.SetWorkloadBuildResult(ctx, workloadID, common.WorkloadReady, rootfsRef); err != nil {
-		log.Printf("workload %s: failed to record build success: %v", workloadID, err)
+		slog.Error("failed to record workload build success", "workload_id", workloadID, "rootfs_ref", rootfsRef, "error", err)
 	}
 }
 
@@ -122,16 +122,16 @@ func (svc *Service) DeleteWorkload(ctx context.Context, workloadID string) error
 func (svc *Service) runDeleteWorkload(ctx context.Context, workloadID string) {
 	ids, err := svc.store.WorkloadInstanceIDs(ctx, workloadID)
 	if err != nil {
-		log.Printf("workload %s: delete cascade: list instances: %v", workloadID, err)
+		slog.Error("delete workload cascade: failed to list instances", "workload_id", workloadID, "error", err)
 		return
 	}
 	for _, id := range ids {
 		if err := svc.runDeleteInstance(ctx, id); err != nil {
-			log.Printf("workload %s: delete cascade: instance %s: %v", workloadID, id, err)
+			slog.Error("delete workload cascade: failed to delete instance", "workload_id", workloadID, "instance_id", id, "error", err)
 		}
 	}
 	if err := svc.store.DeleteWorkload(ctx, workloadID); err != nil {
-		log.Printf("workload %s: delete cascade: delete workload record: %v", workloadID, err)
+		slog.Error("delete workload cascade: failed to delete workload record", "workload_id", workloadID, "error", err)
 	}
 }
 
@@ -224,7 +224,7 @@ func (svc *Service) SuspendInstance(ctx context.Context, instanceID string) erro
 		// Revert to RUNNING rather than FAILED — the instance is still
 		// alive, just not yet reclaimed. The idle-reaper loop retries next tick.
 		if _, _, cerr := svc.store.CAS(ctx, instanceID, common.InstanceSuspending, common.InstanceRunning); cerr != nil {
-			log.Printf("instance %s: failed to revert SUSPENDING->RUNNING after suspend failure: %v", instanceID, cerr)
+			slog.Error("failed to revert instance SUSPENDING->RUNNING after suspend failure", "instance_id", instanceID, "suspend_error", err, "revert_error", cerr)
 		}
 		return err
 	}
@@ -233,10 +233,10 @@ func (svc *Service) SuspendInstance(ctx context.Context, instanceID string) erro
 		return err
 	}
 	if err := svc.store.ClearDue(ctx, instanceID); err != nil {
-		log.Printf("instance %s: failed to clear instances_due after suspend: %v", instanceID, err)
+		slog.Error("failed to clear instance from idle-reaper due set after suspend", "instance_id", instanceID, "error", err)
 	}
 	if err := svc.store.AdjustHostCapacity(ctx, inst.HostID, -1); err != nil {
-		log.Printf("instance %s: failed to decrement host capacity after suspend: %v", instanceID, err)
+		slog.Error("failed to decrement host capacity after suspend", "instance_id", instanceID, "host_id", inst.HostID, "error", err)
 	}
 	return nil
 }
@@ -294,7 +294,7 @@ func (svc *Service) ResumeInstance(ctx context.Context, instanceID string) (*Ins
 		// Transient/unreachable: revert to SUSPENDED, not FAILED — the
 		// snapshot on disk is untouched, a later invoke just retries.
 		if _, _, cerr := svc.store.CAS(ctx, instanceID, common.InstanceResuming, common.InstanceSuspended); cerr != nil {
-			log.Printf("instance %s: failed to revert RESUMING->SUSPENDED after resume failure: %v", instanceID, cerr)
+			slog.Error("failed to revert instance RESUMING->SUSPENDED after resume failure", "instance_id", instanceID, "resume_error", err, "revert_error", cerr)
 		}
 		return nil, err
 	}
@@ -358,13 +358,22 @@ func (svc *Service) finishBootOrResume(ctx context.Context, instanceID string, f
 		"guest_ip":   ep.GuestIP,
 		"guest_port": ep.GuestPort,
 	}); err != nil {
-		return nil, err
+		// Without this revert, the instance is stuck RUNNING with no
+		// host_id/guest_ip/guest_port: the next idle-reaper tick would CAS
+		// it RUNNING->SUSPENDING, then fail looking up an empty host_id and
+		// leave it wedged in SUSPENDING with no path back (ResumeInstance's
+		// CAS only fires from SUSPENDED). Revert to `from` so the instance
+		// stays in a state CreateInstance/ResumeInstance can retry from.
+		if _, _, cerr := svc.store.CAS(ctx, instanceID, common.InstanceRunning, from); cerr != nil {
+			slog.Error("failed to revert instance RUNNING->"+string(from)+" after endpoint write failure", "instance_id", instanceID, "write_error", err, "revert_error", cerr)
+		}
+		return nil, fmt.Errorf("persist instance endpoint: %w", err)
 	}
 	if err := svc.store.TouchActivity(ctx, instanceID, idleTimeoutSeconds); err != nil {
-		log.Printf("instance %s: failed to touch activity after boot/resume: %v", instanceID, err)
+		slog.Error("failed to touch instance activity after boot/resume", "instance_id", instanceID, "error", err)
 	}
 	if err := svc.store.AdjustHostCapacity(ctx, hostID, 1); err != nil {
-		log.Printf("instance %s: failed to increment host capacity: %v", instanceID, err)
+		slog.Error("failed to increment host capacity", "instance_id", instanceID, "host_id", hostID, "error", err)
 	}
 	tok, exp, err := svc.tokens.Issue(instanceID, ep.GuestIP, ep.GuestPort, hostID, idleTimeoutSeconds)
 	if err != nil {
@@ -385,7 +394,7 @@ func (svc *Service) failInstance(ctx context.Context, instanceID string, from co
 		return nil, err
 	}
 	if err := svc.store.UpdateInstanceFields(ctx, instanceID, map[string]any{"error": cause.Error()}); err != nil {
-		log.Printf("instance %s: failed to record failure reason: %v", instanceID, err)
+		slog.Error("failed to record instance failure reason", "instance_id", instanceID, "cause", cause, "error", err)
 	}
 	return &InstanceResult{InstanceID: instanceID, State: common.InstanceFailed, Error: cause.Error()}, nil
 }
@@ -394,7 +403,7 @@ func (svc *Service) failInstance(ctx context.Context, instanceID string, from co
 func (svc *Service) DeleteInstance(ctx context.Context, instanceID string) error {
 	go func() {
 		if err := svc.runDeleteInstance(context.Background(), instanceID); err != nil {
-			log.Printf("instance %s: delete failed: %v", instanceID, err)
+			slog.Error("instance delete failed", "instance_id", instanceID, "error", err)
 		}
 	}()
 	return nil
@@ -435,7 +444,7 @@ func (svc *Service) runDeleteInstance(ctx context.Context, instanceID string) er
 
 	if inst.State == common.InstanceRunning {
 		if err := svc.store.AdjustHostCapacity(ctx, inst.HostID, -1); err != nil {
-			log.Printf("instance %s: failed to decrement host capacity on delete: %v", instanceID, err)
+			slog.Error("failed to decrement host capacity on delete", "instance_id", instanceID, "host_id", inst.HostID, "error", err)
 		}
 	}
 	return svc.store.DeleteInstance(ctx, inst.WorkloadID, instanceID)

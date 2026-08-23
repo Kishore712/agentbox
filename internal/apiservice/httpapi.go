@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -53,8 +54,9 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 // mapControllerError translates the ControllerClient sentinel errors into
-// the HTTP statuses §4.1 specifies.
-func mapControllerError(w http.ResponseWriter, err error) {
+// the HTTP statuses §4.1 specifies. op identifies the calling handler for
+// the server-side log line on the unclassified (500) path.
+func mapControllerError(w http.ResponseWriter, r *http.Request, op string, err error) {
 	switch {
 	case errors.Is(err, ErrNotFound):
 		writeError(w, http.StatusNotFound, "not found")
@@ -63,7 +65,10 @@ func mapControllerError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrAtCapacity):
 		writeError(w, http.StatusTooManyRequests, "max concurrent sessions reached")
 	default:
-		writeError(w, http.StatusInternalServerError, err.Error())
+		// Unclassified: could be a Controller-unreachable error carrying an
+		// internal URL, so it's logged server-side, not sent to the client.
+		slog.Error("request failed", "op", op, "method", r.Method, "path", r.URL.Path, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
 	}
 }
 
@@ -91,7 +96,7 @@ func (h *httpHandlers) createAgent(w http.ResponseWriter, r *http.Request) {
 		MaxConcurrentInstances: req.MaxConcurrentInstances,
 	})
 	if err != nil {
-		mapControllerError(w, err)
+		mapControllerError(w, r, "create_agent", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"agent_id": wl.WorkloadID, "status": wl.Status})
@@ -100,7 +105,7 @@ func (h *httpHandlers) createAgent(w http.ResponseWriter, r *http.Request) {
 func (h *httpHandlers) getAgent(w http.ResponseWriter, r *http.Request) {
 	wl, err := h.svc.GetAgent(r.Context(), r.PathValue("id"))
 	if err != nil {
-		mapControllerError(w, err)
+		mapControllerError(w, r, "get_agent", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -113,7 +118,7 @@ func (h *httpHandlers) getAgent(w http.ResponseWriter, r *http.Request) {
 
 func (h *httpHandlers) deleteAgent(w http.ResponseWriter, r *http.Request) {
 	if err := h.svc.DeleteAgent(r.Context(), r.PathValue("id")); err != nil {
-		mapControllerError(w, err)
+		mapControllerError(w, r, "delete_agent", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "deleting"})
@@ -133,7 +138,7 @@ func sessionResultJSON(res *InstanceResult) map[string]any {
 func (h *httpHandlers) createSession(w http.ResponseWriter, r *http.Request) {
 	res, err := h.svc.CreateSession(r.Context(), r.PathValue("id"))
 	if err != nil {
-		mapControllerError(w, err)
+		mapControllerError(w, r, "create_session", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, sessionResultJSON(res))
@@ -142,7 +147,7 @@ func (h *httpHandlers) createSession(w http.ResponseWriter, r *http.Request) {
 func (h *httpHandlers) getSession(w http.ResponseWriter, r *http.Request) {
 	inst, err := h.svc.GetSession(r.Context(), r.PathValue("sid"))
 	if err != nil {
-		mapControllerError(w, err)
+		mapControllerError(w, r, "get_session", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -153,7 +158,7 @@ func (h *httpHandlers) getSession(w http.ResponseWriter, r *http.Request) {
 
 func (h *httpHandlers) deleteSession(w http.ResponseWriter, r *http.Request) {
 	if err := h.svc.DeleteSession(r.Context(), r.PathValue("sid")); err != nil {
-		mapControllerError(w, err)
+		mapControllerError(w, r, "delete_session", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "deleting"})
@@ -195,7 +200,10 @@ func (h *httpHandlers) invoke(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, ErrAtCapacity):
 			writeError(w, http.StatusTooManyRequests, "max concurrent sessions reached")
 		default:
-			writeError(w, http.StatusBadGateway, err.Error())
+			// Unclassified: typically a guest-proxy dial/timeout failure,
+			// which can carry an internal guest IP — log it, don't forward it.
+			slog.Error("request failed", "op", "invoke", "method", r.Method, "path", r.URL.Path, "error", err)
+			writeError(w, http.StatusBadGateway, "upstream request failed")
 		}
 		return
 	}
