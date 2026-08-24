@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 )
 
@@ -93,6 +94,101 @@ func TestHTTP_ResumeVM_SnapshotMissingReturns404(t *testing.T) {
 	rec := doJSON(t, mux, "POST", "/vm/never-booted/resume", nil)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("got %d, want 404", rec.Code)
+	}
+}
+
+func TestHTTP_Proxy_ForwardsToRegisteredInstance(t *testing.T) {
+	ops := newFakeHostOps()
+	fc := &fakeFirecrackerClient{}
+	proxy := &fakeGuestProxy{forwardResponse: &ProxyResponse{StatusCode: http.StatusTeapot, Body: []byte("hello")}}
+	mgr := newTestManagerWithProxy(ops, fc, &fakeReadiness{}, proxy)
+	mux := NewRouter(mgr)
+
+	rec := doJSON(t, mux, "POST", "/vm", bootVMRequest{InstanceID: "inst-1"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("boot: got %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = doJSON(t, mux, "POST", "/vm/inst-1/proxy", nil)
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("proxy: got %d, want the guest's passthrough status 418, body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get(proxyErrorHeader) != "" {
+		t.Errorf("a real guest passthrough response must never carry %s", proxyErrorHeader)
+	}
+	if rec.Body.String() != "hello" {
+		t.Errorf("body = %q, want the guest's passthrough body", rec.Body.String())
+	}
+}
+
+func TestHTTP_Proxy_UnknownInstanceReturns404WithMarkerHeader(t *testing.T) {
+	mux := newTestHTTPRouter(newFakeHostOps(), &fakeFirecrackerClient{}, &fakeReadiness{})
+
+	rec := doJSON(t, mux, "POST", "/vm/never-booted/proxy", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", rec.Code)
+	}
+	if rec.Header().Get(proxyErrorHeader) != "registry-miss" {
+		t.Errorf("X-Agentbox-Proxy-Error = %q, want registry-miss — this is the signal the REST API Service's fallback relies on", rec.Header().Get(proxyErrorHeader))
+	}
+}
+
+func TestHTTP_Proxy_GuestUnreachableReturns502WithMarkerHeader(t *testing.T) {
+	ops := newFakeHostOps()
+	fc := &fakeFirecrackerClient{}
+	proxy := &fakeGuestProxy{forwardErr: errAny}
+	mgr := newTestManagerWithProxy(ops, fc, &fakeReadiness{}, proxy)
+	mux := NewRouter(mgr)
+
+	rec := doJSON(t, mux, "POST", "/vm", bootVMRequest{InstanceID: "inst-1"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("boot: got %d, body=%s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, mux, "POST", "/vm/inst-1/proxy", nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("got %d, want 502", rec.Code)
+	}
+	if rec.Header().Get(proxyErrorHeader) != "guest-unreachable" {
+		t.Errorf("X-Agentbox-Proxy-Error = %q, want guest-unreachable", rec.Header().Get(proxyErrorHeader))
+	}
+}
+
+func TestHTTP_GoldenRootfs_PushThenCheck(t *testing.T) {
+	mux := newTestHTTPRouter(newFakeHostOps(), &fakeFirecrackerClient{}, &fakeReadiness{})
+	path := "/data/workloads/wl_1/rootfs.ext4"
+
+	// Not there yet.
+	req := httptest.NewRequest("HEAD", "/golden-rootfs?path="+url.QueryEscape(path), nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("HEAD before push: got %d, want 404", rec.Code)
+	}
+
+	// Push it.
+	req = httptest.NewRequest("PUT", "/golden-rootfs?path="+url.QueryEscape(path), bytes.NewReader([]byte("rootfs bytes")))
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT: got %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Now it's there.
+	req = httptest.NewRequest("HEAD", "/golden-rootfs?path="+url.QueryEscape(path), nil)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HEAD after push: got %d, want 200", rec.Code)
+	}
+}
+
+func TestHTTP_GoldenRootfs_MissingPathParamIsBadRequest(t *testing.T) {
+	mux := newTestHTTPRouter(newFakeHostOps(), &fakeFirecrackerClient{}, &fakeReadiness{})
+	req := httptest.NewRequest("PUT", "/golden-rootfs", bytes.NewReader([]byte("x")))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
 	}
 }
 

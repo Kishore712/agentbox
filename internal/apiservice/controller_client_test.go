@@ -25,7 +25,7 @@ func TestHTTPControllerClient_CreateAndGetWorkload(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewHTTPControllerClient(srv.URL)
+	c := NewHTTPControllerClient(srv.URL, 15*time.Second)
 	w, err := c.CreateWorkload(t.Context(), CreateWorkloadRequest{Name: "my-agent"})
 	if err != nil {
 		t.Fatalf("CreateWorkload: %v", err)
@@ -50,7 +50,7 @@ func TestHTTPControllerClient_GetWorkload_404MapsToErrNotFound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewHTTPControllerClient(srv.URL)
+	c := NewHTTPControllerClient(srv.URL, 15*time.Second)
 	_, err := c.GetWorkload(t.Context(), "nonexistent")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("got %v, want ErrNotFound", err)
@@ -71,7 +71,7 @@ func TestHTTPControllerClient_CreateInstance_MapsStatusCodes(t *testing.T) {
 			w.WriteHeader(tt.status)
 			json.NewEncoder(w).Encode(map[string]string{"error": "x"})
 		}))
-		c := NewHTTPControllerClient(srv.URL)
+		c := NewHTTPControllerClient(srv.URL, 15*time.Second)
 		_, err := c.CreateInstance(t.Context(), "wl_1")
 		if !errors.Is(err, tt.wantErr) {
 			t.Errorf("status %d: got %v, want %v", tt.status, err, tt.wantErr)
@@ -86,11 +86,11 @@ func TestHTTPControllerClient_CreateInstance_Success(t *testing.T) {
 			t.Errorf("path = %s", r.URL.Path)
 		}
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(InstanceResult{InstanceID: "inst-1", State: "RUNNING", GuestIP: "172.16.0.2", GuestPort: 8080, RoutingToken: "tok"})
+		json.NewEncoder(w).Encode(InstanceResult{InstanceID: "inst-1", State: "RUNNING", HostAgentAddr: "10.0.1.5:9000"})
 	}))
 	defer srv.Close()
 
-	c := NewHTTPControllerClient(srv.URL)
+	c := NewHTTPControllerClient(srv.URL, 15*time.Second)
 	res, err := c.CreateInstance(t.Context(), "wl_1")
 	if err != nil {
 		t.Fatalf("CreateInstance: %v", err)
@@ -110,7 +110,7 @@ func TestHTTPControllerClient_Heartbeat_FireAndForget(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewHTTPControllerClient(srv.URL)
+	c := NewHTTPControllerClient(srv.URL, 15*time.Second)
 	c.Heartbeat(t.Context(), "inst-1") // must not block
 
 	select {

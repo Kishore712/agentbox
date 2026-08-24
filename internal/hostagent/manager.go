@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -14,6 +15,13 @@ import (
 // own ErrSnapshotMissing sentinel (§4.2) — the two services share no Go
 // types, only this status-code convention over HTTP.
 var ErrSnapshotMissing = errors.New("snapshot or instance metadata missing")
+
+// ErrInstanceNotRegistered is returned by Proxy when instance_id isn't in
+// the live registry right now — almost always because it's suspended, but
+// also true for an instance that never booted on this host. The HTTP layer
+// maps this to 404, the exact signal the REST API Service's routing-cache
+// fallback is built around (design doc §4.1/§4.3).
+var ErrInstanceNotRegistered = errors.New("instance not registered on this host")
 
 // BootRequest mirrors the Controller's POST /vm body (§4.2 "B) Host Agent
 // API"). Defined locally rather than imported from the controller package —
@@ -49,10 +57,12 @@ type VMManager struct {
 	fcFactory func(socketPath string) FirecrackerClient
 	readiness ReadinessChecker
 	cfg       Config
+	proxy     GuestProxy
+	registry  *instanceRegistry
 }
 
-func NewVMManager(ops HostOps, fcFactory func(string) FirecrackerClient, readiness ReadinessChecker, cfg Config) *VMManager {
-	return &VMManager{ops: ops, fcFactory: fcFactory, readiness: readiness, cfg: cfg}
+func NewVMManager(ops HostOps, fcFactory func(string) FirecrackerClient, readiness ReadinessChecker, cfg Config, proxy GuestProxy) *VMManager {
+	return &VMManager{ops: ops, fcFactory: fcFactory, readiness: readiness, cfg: cfg, proxy: proxy, registry: newInstanceRegistry()}
 }
 
 // BootVM implements §4.3 "Flow — Boot a microVM", steps 1-7 (kernel staging
@@ -93,6 +103,7 @@ func (m *VMManager) BootVM(ctx context.Context, req BootRequest) (VMEndpoint, er
 	if err != nil {
 		return VMEndpoint{}, err
 	}
+	m.registry.set(req.InstanceID, ep) // step 7: registry and the returned endpoint always agree
 	return ep, nil
 }
 
@@ -140,11 +151,20 @@ func (m *VMManager) waitReadyAndBuildEndpoint(ctx context.Context, guestIP strin
 	return VMEndpoint{GuestIP: guestIP, GuestPort: m.cfg.GuestPort}, nil
 }
 
-// SuspendVM implements §4.3 "Flow — Snapshot/suspend".
+// SuspendVM implements §4.3 "Flow — Snapshot/suspend". A Pause/snapshot
+// failure leaves the instance running and routable, matching the
+// Controller's own assumption on a failed suspend call (state reverts to
+// RUNNING, not FAILED — §4.2) — so the registry entry is only removed once
+// StopFirecrackerProcess actually succeeds, the point past which the
+// instance is definitely no longer reachable at its old guest_ip:port,
+// regardless of whether the later TeardownNetwork step also succeeds.
 func (m *VMManager) SuspendVM(ctx context.Context, instanceID string) error {
 	fc := m.fcFactory(m.ops.SocketPath(instanceID))
 	if err := fc.Pause(ctx); err != nil {
 		return fmt.Errorf("pause: %w", err)
+	}
+	if err := m.ops.PrepareSnapshotDir(ctx, instanceID); err != nil {
+		return fmt.Errorf("prepare snapshot dir: %w", err)
 	}
 	snapshotPath, memFilePath := m.ops.SnapshotPaths(instanceID)
 	if err := fc.CreateSnapshot(ctx, snapshotPath, memFilePath); err != nil {
@@ -153,6 +173,7 @@ func (m *VMManager) SuspendVM(ctx context.Context, instanceID string) error {
 	if err := m.ops.StopFirecrackerProcess(ctx, instanceID); err != nil {
 		return fmt.Errorf("stop firecracker process: %w", err)
 	}
+	m.registry.delete(instanceID)
 	if err := m.ops.TeardownNetwork(ctx, instanceID); err != nil {
 		return fmt.Errorf("teardown network: %w", err)
 	}
@@ -191,14 +212,52 @@ func (m *VMManager) ResumeVM(ctx context.Context, instanceID string) (VMEndpoint
 		return VMEndpoint{}, fmt.Errorf("%w: load snapshot: %v", ErrSnapshotMissing, err)
 	}
 
-	return m.waitReadyAndBuildEndpoint(ctx, net.GuestIP)
+	ep, err := m.waitReadyAndBuildEndpoint(ctx, net.GuestIP)
+	if err != nil {
+		return VMEndpoint{}, err
+	}
+	m.registry.set(instanceID, ep) // replaces any stale entry — same "registry agrees with response" property as BootVM
+	return ep, nil
 }
 
 // DeleteVM implements §4.3 "Flow — Delete": best-effort process/network
 // teardown (idempotent — fine if already gone), then the consequential
-// step, deleting the instance's files.
+// step, deleting the instance's files. The registry entry is removed
+// unconditionally and first — deletion is definitionally "this instance
+// should not be reachable," regardless of how far the best-effort teardown
+// below gets.
 func (m *VMManager) DeleteVM(ctx context.Context, instanceID string) error {
+	m.registry.delete(instanceID)
 	_ = m.ops.StopFirecrackerProcess(ctx, instanceID)
 	_ = m.ops.TeardownNetwork(ctx, instanceID)
 	return m.ops.DeleteInstanceFiles(ctx, instanceID)
+}
+
+// HasRootfs and SaveRootfs implement §4.6's placement-locality fix — thin
+// passthroughs to HostOps, exposed over HTTP (httpapi.go) so the Controller
+// can check-then-push a workload's golden rootfs to whichever host actually
+// needs it, without assuming Controller and every Host Agent share a
+// filesystem.
+func (m *VMManager) HasRootfs(ctx context.Context, rootfsPath string) (bool, error) {
+	return m.ops.HasRootfs(ctx, rootfsPath)
+}
+
+func (m *VMManager) SaveRootfs(ctx context.Context, rootfsPath string, data io.Reader) error {
+	return m.ops.SaveRootfs(ctx, rootfsPath, data)
+}
+
+// Proxy implements §4.3 "Flow — Data-plane proxy": resolve instance_id to
+// its current guest_ip:port from the live registry — never cached upstream
+// of this call — and forward. Returns ErrInstanceNotRegistered (mapped to
+// 404 by the HTTP layer) when instance_id isn't registered here right now;
+// any other error is a guest-unreachable failure (mapped to 502) — the two
+// are deliberately distinguishable so the REST API Service's caller knows
+// whether a resume is likely to help (404) or something else is actually
+// broken (502).
+func (m *VMManager) Proxy(ctx context.Context, instanceID string, req *ProxyRequest) (*ProxyResponse, error) {
+	ep, ok := m.registry.get(instanceID)
+	if !ok {
+		return nil, ErrInstanceNotRegistered
+	}
+	return m.proxy.Forward(ctx, ep.GuestIP, ep.GuestPort, req)
 }

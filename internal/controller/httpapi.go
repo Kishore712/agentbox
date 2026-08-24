@@ -124,6 +124,10 @@ func (h *httpHandlers) deleteWorkload(w http.ResponseWriter, r *http.Request) {
 
 // instanceResultJSON renders an InstanceResult per §4.2's convention: a
 // FAILED result still carries instance_id/state/error, never routing info.
+// host_agent_addr, not guest_ip/guest_port: the Host Agent is the only
+// thing that ever resolves an instance to a live guest address, and only
+// at proxy time (§4.3) — nothing upstream of it, including this response,
+// ever carries one.
 func instanceResultJSON(res *InstanceResult) map[string]any {
 	m := map[string]any{"instance_id": res.InstanceID, "state": res.State}
 	if res.Error != "" {
@@ -131,10 +135,7 @@ func instanceResultJSON(res *InstanceResult) map[string]any {
 		return m
 	}
 	m["host_id"] = res.HostID
-	m["guest_ip"] = res.GuestIP
-	m["guest_port"] = res.GuestPort
-	m["routing_token"] = res.RoutingToken
-	m["token_exp"] = res.TokenExp
+	m["host_agent_addr"] = res.HostAgentAddr
 	return m
 }
 

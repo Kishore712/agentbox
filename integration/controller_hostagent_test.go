@@ -10,8 +10,11 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -25,18 +28,30 @@ import (
 
 // --- Stubs for the Linux/KVM-only pieces ---
 
+// stubImageBuilder writes a real (tiny) file at rootfsRef, not just a path
+// string — the real HTTPHostAgentClient.PushRootfs (§4.6's placement-
+// locality fix) opens it from local disk to stream to the Host Agent, so
+// it has to actually exist for this integration test to exercise that
+// path honestly.
 type stubImageBuilder struct{ rootfsRef string }
 
 func (s *stubImageBuilder) Build(ctx context.Context, workloadID, imageRef string) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(s.rootfsRef), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(s.rootfsRef, []byte("stub rootfs contents"), 0o644); err != nil {
+		return "", err
+	}
 	return s.rootfsRef, nil
 }
 
 type stubHostOps struct {
 	metadata map[string]hostagent.InstanceMetadata
+	rootfs   map[string][]byte
 }
 
 func newStubHostOps() *stubHostOps {
-	return &stubHostOps{metadata: map[string]hostagent.InstanceMetadata{}}
+	return &stubHostOps{metadata: map[string]hostagent.InstanceMetadata{}, rootfs: map[string][]byte{}}
 }
 
 func (s *stubHostOps) PrepareKernel(ctx context.Context, goldenKernelPath, instanceID string) (string, error) {
@@ -61,6 +76,9 @@ func (s *stubHostOps) StopFirecrackerProcess(ctx context.Context, instanceID str
 func (s *stubHostOps) SnapshotPaths(instanceID string) (string, string) {
 	return "/data/instances/" + instanceID + "/snapshot/vmstate", "/data/instances/" + instanceID + "/snapshot/mem_file"
 }
+func (s *stubHostOps) PrepareSnapshotDir(ctx context.Context, instanceID string) error {
+	return nil
+}
 func (s *stubHostOps) SocketPath(instanceID string) string {
 	return "/run/firecracker/" + instanceID + ".socket"
 }
@@ -77,6 +95,18 @@ func (s *stubHostOps) LoadInstanceMetadata(ctx context.Context, instanceID strin
 }
 func (s *stubHostOps) DeleteInstanceFiles(ctx context.Context, instanceID string) error {
 	delete(s.metadata, instanceID)
+	return nil
+}
+func (s *stubHostOps) HasRootfs(ctx context.Context, rootfsPath string) (bool, error) {
+	_, ok := s.rootfs[rootfsPath]
+	return ok, nil
+}
+func (s *stubHostOps) SaveRootfs(ctx context.Context, rootfsPath string, data io.Reader) error {
+	b, err := io.ReadAll(data)
+	if err != nil {
+		return err
+	}
+	s.rootfs[rootfsPath] = b
 	return nil
 }
 
@@ -131,12 +161,15 @@ func newHarness(t *testing.T) *harness {
 	}
 	t.Cleanup(func() { rdb.FlushDB(ctx); rdb.Close() })
 
-	// Host Agent: real HTTP server, stubbed VM operations.
+	// Host Agent: real HTTP server, stubbed VM operations. The guest proxy
+	// is real (§4.3's data-plane forward) but unused by this test — it
+	// only exercises the control-plane boot/suspend/resume/delete flow.
 	mgr := hostagent.NewVMManager(
 		newStubHostOps(),
 		func(string) hostagent.FirecrackerClient { return stubFirecrackerClient{} },
 		stubReadiness{},
 		hostagent.Config{KernelImagePath: "/data/vmlinux", GuestPort: 8080, BootTimeout: time.Second},
+		hostagent.NewHTTPGuestProxy(time.Second),
 	)
 	haServer := httptest.NewServer(hostagent.NewRouter(mgr))
 	t.Cleanup(haServer.Close)
@@ -145,10 +178,9 @@ func newHarness(t *testing.T) *harness {
 	// Controller: real HTTP server, real Redis, real HTTPHostAgentClient
 	// pointed at the Host Agent server above.
 	store := controller.NewStore(rdb)
-	tokens := controller.NewTokenIssuer([]byte("integration-test-secret"))
 	ha := controller.NewHTTPHostAgentClient()
-	ib := &stubImageBuilder{rootfsRef: "/data/workloads/integration/rootfs.ext4"}
-	svc := controller.NewService(store, ha, tokens, ib)
+	ib := &stubImageBuilder{rootfsRef: filepath.Join(t.TempDir(), "rootfs.ext4")}
+	svc := controller.NewService(store, ha, ib)
 	ctrlServer := httptest.NewServer(controller.NewRouter(svc))
 	t.Cleanup(ctrlServer.Close)
 
@@ -243,8 +275,13 @@ func TestIntegration_FullInstanceLifecycle(t *testing.T) {
 		t.Fatalf("state = %v, want RUNNING (error=%v)", inst["state"], inst["error"])
 	}
 	instanceID, _ := inst["instance_id"].(string)
-	if instanceID == "" || inst["routing_token"] == "" || inst["guest_ip"] != "172.16.0.2" {
+	if instanceID == "" || inst["host_agent_addr"] == "" {
 		t.Fatalf("unexpected create-instance response: %v", inst)
+	}
+	for _, field := range []string{"guest_ip", "guest_port", "routing_token"} {
+		if _, present := inst[field]; present {
+			t.Errorf("create-instance response must never carry %q (§4.3) — got %v", field, inst)
+		}
 	}
 
 	// 3. Suspend. §4.2: never called by the REST API Service in practice —

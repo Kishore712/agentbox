@@ -5,22 +5,21 @@ import (
 	"errors"
 	"net/http"
 	"testing"
-	"time"
-
-	"github.com/golang-jwt/jwt/v5"
 )
 
 // --- Fakes ---
 
 type fakeControllerClient struct {
-	workloads         map[string]*Workload
-	instances         map[string]*Instance
-	createInstanceRes *InstanceResult
-	createInstanceErr error
-	resumeInstanceRes *InstanceResult
-	resumeInstanceErr error
-	heartbeatCalls    []string
-	deleteInstanceErr error
+	workloads           map[string]*Workload
+	instances           map[string]*Instance
+	createInstanceRes   *InstanceResult
+	createInstanceErr   error
+	createInstanceCalls int
+	resumeInstanceRes   *InstanceResult
+	resumeInstanceErr   error
+	resumeInstanceCalls int
+	heartbeatCalls      []string
+	deleteInstanceErr   error
 }
 
 func newFakeControllerClient() *fakeControllerClient {
@@ -44,6 +43,7 @@ func (f *fakeControllerClient) DeleteWorkload(ctx context.Context, workloadID st
 	return nil
 }
 func (f *fakeControllerClient) CreateInstance(ctx context.Context, workloadID string) (*InstanceResult, error) {
+	f.createInstanceCalls++
 	if f.createInstanceErr != nil {
 		return nil, f.createInstanceErr
 	}
@@ -57,6 +57,7 @@ func (f *fakeControllerClient) GetInstance(ctx context.Context, instanceID strin
 	return inst, nil
 }
 func (f *fakeControllerClient) ResumeInstance(ctx context.Context, instanceID string) (*InstanceResult, error) {
+	f.resumeInstanceCalls++
 	if f.resumeInstanceErr != nil {
 		return nil, f.resumeInstanceErr
 	}
@@ -69,62 +70,68 @@ func (f *fakeControllerClient) DeleteInstance(ctx context.Context, instanceID st
 	return f.deleteInstanceErr
 }
 
-type fakeGuestProxy struct {
+// fakeHostAgentProxy implements HostAgentProxy — records which
+// host_agent_addr each call went to, so tests can assert this service
+// never resolves a guest address itself (§4.1/§4.3: only the Host Agent
+// ever does that).
+type fakeHostAgentProxy struct {
 	response  *ProxyResponse
 	err       error
-	forwarded []string // "guestIP:guestPort" per call, for assertions
+	forwarded []string // hostAgentAddr per call
 }
 
-func (f *fakeGuestProxy) Forward(ctx context.Context, guestIP string, guestPort int, req *ProxyRequest) (*ProxyResponse, error) {
-	f.forwarded = append(f.forwarded, guestIP)
+func (f *fakeHostAgentProxy) Forward(ctx context.Context, hostAgentAddr, instanceID string, req *ProxyRequest) (*ProxyResponse, error) {
+	f.forwarded = append(f.forwarded, hostAgentAddr)
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.response, nil
 }
 
-// issueTestToken signs a token exactly the way the Controller's issuer
-// would (§4.2's routing token contract) — constructed here directly since
-// apiservice only ever verifies, never issues (§4.1).
-func issueTestToken(t *testing.T, secret []byte, instanceID, guestIP string, guestPort int, ttl time.Duration) string {
-	t.Helper()
-	claims := RoutingClaims{
-		InstanceID: instanceID, GuestIP: guestIP, GuestPort: guestPort,
-		RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl))},
+// proxyThatFailsOnce fails the first Forward call and succeeds
+// thereafter — simulates "cached host_agent_addr, but the Host Agent
+// rejected the call" (registry-miss or guest-unreachable, §4.3) without
+// needing a real network failure.
+type proxyThatFailsOnce struct {
+	calls     []string
+	failed    bool
+	onSuccess *ProxyResponse
+}
+
+func (p *proxyThatFailsOnce) Forward(ctx context.Context, hostAgentAddr, instanceID string, req *ProxyRequest) (*ProxyResponse, error) {
+	p.calls = append(p.calls, hostAgentAddr)
+	if !p.failed {
+		p.failed = true
+		return nil, ErrHostAgentRoutingFailed
 	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signed, err := tok.SignedString(secret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return signed
+	return p.onSuccess, nil
 }
 
 // --- Invoke: implicit creation (no session_id) ---
 
 func TestInvoke_ImplicitCreate_Success(t *testing.T) {
 	ctrl := newFakeControllerClient()
-	ctrl.createInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, GuestIP: "172.16.0.2", GuestPort: 8080, RoutingToken: "tok-1"}
-	proxy := &fakeGuestProxy{response: &ProxyResponse{StatusCode: 200, Header: http.Header{}, Body: []byte("hello")}}
-	svc := NewService(ctrl, NewTokenVerifier([]byte("secret")), proxy)
+	ctrl.createInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, HostID: "host-1", HostAgentAddr: "10.0.1.5:9000"}
+	proxy := &fakeHostAgentProxy{response: &ProxyResponse{StatusCode: 200, Header: http.Header{}, Body: []byte("hello")}}
+	svc := NewService(ctrl, proxy, 0)
 
 	res, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodPost, Header: http.Header{}})
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
-	if res.SessionID != "inst-1" || res.RoutingToken != "tok-1" {
-		t.Errorf("expected session_id/token to be announced on create, got %+v", res)
+	if res.SessionID != "inst-1" {
+		t.Errorf("expected session_id to be announced on create, got %+v", res)
 	}
 	if string(res.Body) != "hello" {
 		t.Errorf("body = %q", res.Body)
 	}
-	if len(proxy.forwarded) != 1 || proxy.forwarded[0] != "172.16.0.2" {
-		t.Errorf("expected exactly one proxy call to 172.16.0.2, got %v", proxy.forwarded)
+	if len(proxy.forwarded) != 1 || proxy.forwarded[0] != "10.0.1.5:9000" {
+		t.Errorf("expected exactly one proxy call to the Host Agent, got %v", proxy.forwarded)
 	}
 }
 
 func TestInvoke_ImplicitCreate_GETNotAllowed(t *testing.T) {
-	svc := NewService(newFakeControllerClient(), NewTokenVerifier([]byte("secret")), &fakeGuestProxy{})
+	svc := NewService(newFakeControllerClient(), &fakeHostAgentProxy{}, 0)
 	_, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodGet, Header: http.Header{}})
 	if !errors.Is(err, ErrSessionIDRequired) {
 		t.Fatalf("got %v, want ErrSessionIDRequired", err)
@@ -134,7 +141,7 @@ func TestInvoke_ImplicitCreate_GETNotAllowed(t *testing.T) {
 func TestInvoke_ImplicitCreate_Failed(t *testing.T) {
 	ctrl := newFakeControllerClient()
 	ctrl.createInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateFailed, Error: "boot timeout"}
-	svc := NewService(ctrl, NewTokenVerifier([]byte("secret")), &fakeGuestProxy{})
+	svc := NewService(ctrl, &fakeHostAgentProxy{}, 0)
 
 	_, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodPost, Header: http.Header{}})
 	var failed *SessionFailedError
@@ -149,7 +156,7 @@ func TestInvoke_ImplicitCreate_Failed(t *testing.T) {
 func TestInvoke_ImplicitCreate_AtCapacity(t *testing.T) {
 	ctrl := newFakeControllerClient()
 	ctrl.createInstanceErr = ErrAtCapacity
-	svc := NewService(ctrl, NewTokenVerifier([]byte("secret")), &fakeGuestProxy{})
+	svc := NewService(ctrl, &fakeHostAgentProxy{}, 0)
 
 	_, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodPost, Header: http.Header{}})
 	if !errors.Is(err, ErrAtCapacity) {
@@ -157,20 +164,24 @@ func TestInvoke_ImplicitCreate_AtCapacity(t *testing.T) {
 	}
 }
 
-// --- Invoke: warm path (valid token, zero Controller calls for routing) ---
+// --- Invoke: warm path (cache hit, zero Controller calls for routing) ---
 
 func TestInvoke_WarmPath_NoControllerCallForRouting(t *testing.T) {
-	secret := []byte("shared-secret")
 	ctrl := newFakeControllerClient()
-	// If the warm path is broken and falls through to resume, this would
-	// be used — leaving it unset (nil) makes the test fail loudly instead
-	// of silently succeeding via the fallback.
-	proxy := &fakeGuestProxy{response: &ProxyResponse{StatusCode: 200, Header: http.Header{}, Body: []byte("warm")}}
-	svc := NewService(ctrl, NewTokenVerifier(secret), proxy)
+	ctrl.createInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, HostID: "host-1", HostAgentAddr: "10.0.1.5:9000"}
+	proxy := &fakeHostAgentProxy{response: &ProxyResponse{StatusCode: 200, Header: http.Header{}, Body: []byte("warm")}}
+	svc := NewService(ctrl, proxy, 0)
 
-	token := issueTestToken(t, secret, "inst-1", "172.16.0.5", 8080, time.Minute)
+	// Cold start populates the cache.
+	if _, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodPost, Header: http.Header{}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// If the warm path is broken and falls through to resume, this would be
+	// used — leaving it unset (nil) makes the test fail loudly instead of
+	// silently succeeding via the fallback.
 	res, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{
-		Method: http.MethodPost, SessionID: "inst-1", RoutingToken: token, Header: http.Header{},
+		Method: http.MethodPost, SessionID: "inst-1", Header: http.Header{},
 	})
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
@@ -181,105 +192,105 @@ func TestInvoke_WarmPath_NoControllerCallForRouting(t *testing.T) {
 	if res.SessionID != "" {
 		t.Errorf("warm path should not re-announce session_id, got %q", res.SessionID)
 	}
-	if res.RoutingToken != token {
-		t.Errorf("expected the same token echoed back, got %q", res.RoutingToken)
+	if len(proxy.forwarded) != 2 || proxy.forwarded[1] != "10.0.1.5:9000" {
+		t.Errorf("expected a second direct proxy call via the cached host_agent_addr, got %v", proxy.forwarded)
 	}
-	if len(proxy.forwarded) != 1 || proxy.forwarded[0] != "172.16.0.5" {
-		t.Errorf("expected exactly one direct proxy call to 172.16.0.5, got %v", proxy.forwarded)
+	if ctrl.resumeInstanceCalls != 0 {
+		t.Errorf("expected zero ResumeInstance calls on a cache hit, got %d", ctrl.resumeInstanceCalls)
 	}
 	if len(ctrl.heartbeatCalls) != 1 || ctrl.heartbeatCalls[0] != "inst-1" {
 		t.Errorf("expected exactly one async heartbeat for inst-1, got %v", ctrl.heartbeatCalls)
 	}
 }
 
-func TestInvoke_WarmPath_TokenForDifferentSessionIgnored(t *testing.T) {
-	secret := []byte("shared-secret")
+func TestInvoke_WarmPath_DifferentSessionsRouteIndependently(t *testing.T) {
 	ctrl := newFakeControllerClient()
-	ctrl.resumeInstanceRes = &InstanceResult{InstanceID: "inst-2", State: StateRunning, GuestIP: "172.16.0.9", GuestPort: 8080, RoutingToken: "fresh-tok"}
-	proxy := &fakeGuestProxy{response: &ProxyResponse{StatusCode: 200, Header: http.Header{}, Body: []byte("via-resume")}}
-	svc := NewService(ctrl, NewTokenVerifier(secret), proxy)
+	proxy := &fakeHostAgentProxy{response: &ProxyResponse{StatusCode: 200, Header: http.Header{}, Body: []byte("ok")}}
+	svc := NewService(ctrl, proxy, 0)
 
-	// Token is valid but for a DIFFERENT instance than the one requested —
-	// must not be trusted for routing.
-	token := issueTestToken(t, secret, "inst-1", "172.16.0.5", 8080, time.Minute)
-	res, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{
-		Method: http.MethodPost, SessionID: "inst-2", RoutingToken: token, Header: http.Header{},
-	})
-	if err != nil {
-		t.Fatalf("Invoke: %v", err)
+	ctrl.createInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, HostID: "host-1", HostAgentAddr: "10.0.1.5:9000"}
+	if _, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodPost, Header: http.Header{}}); err != nil {
+		t.Fatal(err)
 	}
-	if string(res.Body) != "via-resume" {
-		t.Errorf("expected the resume-fallback path to have been taken, got body %q", res.Body)
+	ctrl.createInstanceRes = &InstanceResult{InstanceID: "inst-2", State: StateRunning, HostID: "host-2", HostAgentAddr: "10.0.1.6:9000"}
+	if _, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodPost, Header: http.Header{}}); err != nil {
+		t.Fatal(err)
 	}
-	if len(proxy.forwarded) != 1 || proxy.forwarded[0] != "172.16.0.9" {
-		t.Errorf("expected proxy call to the resumed instance's IP, got %v", proxy.forwarded)
+
+	if _, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodPost, SessionID: "inst-1", Header: http.Header{}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodPost, SessionID: "inst-2", Header: http.Header{}}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"10.0.1.5:9000", "10.0.1.6:9000", "10.0.1.5:9000", "10.0.1.6:9000"}
+	if len(proxy.forwarded) != len(want) {
+		t.Fatalf("forwarded = %v, want %v", proxy.forwarded, want)
+	}
+	for i, addr := range want {
+		if proxy.forwarded[i] != addr {
+			t.Errorf("call %d went to %q, want %q — sessions must not cross-route", i, proxy.forwarded[i], addr)
+		}
 	}
 }
 
-// --- Invoke: fallback to resume (expired/missing/invalid token, or a failed direct hit) ---
+// --- Invoke: fallback to resume (cache miss, or the Host Agent rejected the call) ---
 
-func TestInvoke_MissingToken_FallsBackToResume(t *testing.T) {
+func TestInvoke_CacheMiss_FallsBackToResume(t *testing.T) {
 	ctrl := newFakeControllerClient()
-	ctrl.resumeInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, GuestIP: "172.16.0.9", GuestPort: 8080, RoutingToken: "fresh-tok"}
-	proxy := &fakeGuestProxy{response: &ProxyResponse{StatusCode: 200, Header: http.Header{}, Body: []byte("resumed")}}
-	svc := NewService(ctrl, NewTokenVerifier([]byte("secret")), proxy)
+	ctrl.resumeInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, HostID: "host-1", HostAgentAddr: "10.0.1.9:9000"}
+	proxy := &fakeHostAgentProxy{response: &ProxyResponse{StatusCode: 200, Header: http.Header{}, Body: []byte("resumed")}}
+	svc := NewService(ctrl, proxy, 0)
 
 	res, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{
-		Method: http.MethodPost, SessionID: "inst-1", RoutingToken: "", Header: http.Header{},
+		Method: http.MethodPost, SessionID: "inst-1", Header: http.Header{},
 	})
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
 	// session_id is only announced when newly assigned (implicit create) —
-	// the client already knows it here, they supplied it themselves. The
-	// token, however, genuinely changed on resume and must be refreshed.
+	// the client already knows it here, they supplied it themselves.
 	if res.SessionID != "" {
 		t.Errorf("resume should not re-announce session_id (client already has it), got %q", res.SessionID)
 	}
-	if res.RoutingToken != "fresh-tok" {
-		t.Errorf("expected the refreshed token to be announced after a resume, got %q", res.RoutingToken)
+	if ctrl.resumeInstanceCalls != 1 {
+		t.Errorf("expected exactly one ResumeInstance call on a cache miss, got %d", ctrl.resumeInstanceCalls)
+	}
+	if len(proxy.forwarded) != 1 || proxy.forwarded[0] != "10.0.1.9:9000" {
+		t.Errorf("expected the resume-fallback host_agent_addr to be used, got %v", proxy.forwarded)
 	}
 }
 
-func TestInvoke_ExpiredToken_FallsBackToResume(t *testing.T) {
-	secret := []byte("shared-secret")
+func TestInvoke_HostAgentRejectsCachedEntry_FallsBackToResume(t *testing.T) {
 	ctrl := newFakeControllerClient()
-	ctrl.resumeInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, GuestIP: "172.16.0.9", GuestPort: 8080, RoutingToken: "fresh-tok"}
-	proxy := &fakeGuestProxy{response: &ProxyResponse{StatusCode: 200, Header: http.Header{}, Body: []byte("resumed")}}
-	svc := NewService(ctrl, NewTokenVerifier(secret), proxy)
-
-	expired := issueTestToken(t, secret, "inst-1", "172.16.0.5", 8080, -time.Minute) // already expired
-	_, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{
-		Method: http.MethodPost, SessionID: "inst-1", RoutingToken: expired, Header: http.Header{},
-	})
-	if err != nil {
-		t.Fatalf("Invoke: %v", err)
-	}
-	if len(proxy.forwarded) != 1 || proxy.forwarded[0] != "172.16.0.9" {
-		t.Errorf("expected the resume-fallback endpoint to be used, got %v", proxy.forwarded)
-	}
-}
-
-func TestInvoke_DirectConnectionFails_FallsBackToResume(t *testing.T) {
-	secret := []byte("shared-secret")
-	ctrl := newFakeControllerClient()
-	ctrl.resumeInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, GuestIP: "172.16.0.9", GuestPort: 8080, RoutingToken: "fresh-tok"}
+	ctrl.createInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, HostID: "host-1", HostAgentAddr: "10.0.1.5:9000"}
+	ctrl.resumeInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, HostID: "host-1", HostAgentAddr: "10.0.1.9:9000"}
 
 	proxy := &proxyThatFailsOnce{onSuccess: &ProxyResponse{StatusCode: 200, Header: http.Header{}, Body: []byte("ok")}}
-	svc := NewService(ctrl, NewTokenVerifier(secret), proxy)
+	svc := NewService(ctrl, proxy, 0)
 
-	validButStale := issueTestToken(t, secret, "inst-1", "172.16.0.5", 8080, time.Minute) // valid token, but host actually unreachable
+	// CreateSession populates the cache directly from the Controller
+	// response — no proxy call involved, so it doesn't consume
+	// proxyThatFailsOnce's one scripted failure.
+	if _, err := svc.CreateSession(context.Background(), "agt_1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Warm call: the cached address is stale (e.g. the instance suspended
+	// since caching) — the Host Agent rejects it, so this must fall back
+	// to Controller.ResumeInstance and retry via the fresh address.
 	res, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{
-		Method: http.MethodPost, SessionID: "inst-1", RoutingToken: validButStale, Header: http.Header{},
+		Method: http.MethodPost, SessionID: "inst-1", Header: http.Header{},
 	})
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
 	if len(proxy.calls) != 2 {
-		t.Fatalf("expected 2 proxy attempts (failed direct hit, then resume-fallback success), got %d: %v", len(proxy.calls), proxy.calls)
+		t.Fatalf("expected 2 proxy attempts (rejected cached addr, then resume-fallback success), got %d: %v", len(proxy.calls), proxy.calls)
 	}
-	if proxy.calls[0] != "172.16.0.5" || proxy.calls[1] != "172.16.0.9" {
-		t.Errorf("calls = %v, want [172.16.0.5 172.16.0.9]", proxy.calls)
+	if proxy.calls[0] != "10.0.1.5:9000" || proxy.calls[1] != "10.0.1.9:9000" {
+		t.Errorf("calls = %v, want [10.0.1.5:9000 10.0.1.9:9000]", proxy.calls)
 	}
 	if string(res.Body) != "ok" {
 		t.Errorf("body = %q", res.Body)
@@ -289,7 +300,7 @@ func TestInvoke_DirectConnectionFails_FallsBackToResume(t *testing.T) {
 func TestInvoke_ResumeReturnsFailed(t *testing.T) {
 	ctrl := newFakeControllerClient()
 	ctrl.resumeInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateFailed, Error: "snapshot corrupt"}
-	svc := NewService(ctrl, NewTokenVerifier([]byte("secret")), &fakeGuestProxy{})
+	svc := NewService(ctrl, &fakeHostAgentProxy{}, 0)
 
 	_, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{
 		Method: http.MethodPost, SessionID: "inst-1", Header: http.Header{},
@@ -303,7 +314,7 @@ func TestInvoke_ResumeReturnsFailed(t *testing.T) {
 func TestInvoke_UnknownSession(t *testing.T) {
 	ctrl := newFakeControllerClient()
 	ctrl.resumeInstanceErr = ErrNotFound
-	svc := NewService(ctrl, NewTokenVerifier([]byte("secret")), &fakeGuestProxy{})
+	svc := NewService(ctrl, &fakeHostAgentProxy{}, 0)
 
 	_, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{
 		Method: http.MethodPost, SessionID: "does-not-exist", Header: http.Header{},
@@ -314,29 +325,36 @@ func TestInvoke_UnknownSession(t *testing.T) {
 }
 
 func TestInvoke_GET_RequiresSessionID(t *testing.T) {
-	svc := NewService(newFakeControllerClient(), NewTokenVerifier([]byte("secret")), &fakeGuestProxy{})
+	svc := NewService(newFakeControllerClient(), &fakeHostAgentProxy{}, 0)
 	_, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodGet, SessionID: "", Header: http.Header{}})
 	if !errors.Is(err, ErrSessionIDRequired) {
 		t.Fatalf("got %v, want ErrSessionIDRequired", err)
 	}
 }
 
-// proxyThatFailsOnce fails the first Forward call and succeeds thereafter —
-// simulates "valid token, but the host is actually unreachable" without
-// needing a real network failure.
-type proxyThatFailsOnce struct {
-	calls     []string
-	failed    bool
-	onSuccess *ProxyResponse
-}
+// --- DeleteSession evicts the routing cache ---
 
-func (p *proxyThatFailsOnce) Forward(ctx context.Context, guestIP string, guestPort int, req *ProxyRequest) (*ProxyResponse, error) {
-	p.calls = append(p.calls, guestIP)
-	if !p.failed {
-		p.failed = true
-		return nil, errConnRefused
+func TestDeleteSession_EvictsCacheEntry(t *testing.T) {
+	ctrl := newFakeControllerClient()
+	ctrl.createInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, HostID: "host-1", HostAgentAddr: "10.0.1.5:9000"}
+	ctrl.resumeInstanceRes = &InstanceResult{InstanceID: "inst-1", State: StateRunning, HostID: "host-1", HostAgentAddr: "10.0.1.9:9000"}
+	proxy := &fakeHostAgentProxy{response: &ProxyResponse{StatusCode: 200, Header: http.Header{}, Body: []byte("ok")}}
+	svc := NewService(ctrl, proxy, 0)
+
+	if _, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodPost, Header: http.Header{}}); err != nil {
+		t.Fatal(err)
 	}
-	return p.onSuccess, nil
-}
+	if err := svc.DeleteSession(context.Background(), "inst-1"); err != nil {
+		t.Fatal(err)
+	}
 
-var errConnRefused = errors.New("connection refused")
+	// The cache must be empty now — the next call for this session_id has
+	// to go through the Controller again (it's a cache-miss), not reuse
+	// the deleted instance's stale host_agent_addr.
+	if _, err := svc.Invoke(context.Background(), "agt_1", InvokeRequest{Method: http.MethodPost, SessionID: "inst-1", Header: http.Header{}}); err != nil {
+		t.Fatal(err)
+	}
+	if ctrl.resumeInstanceCalls != 1 {
+		t.Errorf("expected DeleteSession to force a ResumeInstance call on next use, got %d calls", ctrl.resumeInstanceCalls)
+	}
+}

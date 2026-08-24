@@ -180,11 +180,10 @@ func (h *httpHandlers) invoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := h.svc.Invoke(r.Context(), r.PathValue("id"), InvokeRequest{
-		Method:       r.Method,
-		SessionID:    sessionID,
-		RoutingToken: r.Header.Get("X-Routing-Token"),
-		Header:       r.Header,
-		Body:         body,
+		Method:    r.Method,
+		SessionID: sessionID,
+		Header:    r.Header,
+		Body:      body,
 	})
 	if err != nil {
 		var failed *SessionFailedError
@@ -215,9 +214,6 @@ func (h *httpHandlers) invoke(w http.ResponseWriter, r *http.Request) {
 	}
 	if result.SessionID != "" {
 		w.Header().Set("X-Session-Id", result.SessionID)
-	}
-	if result.RoutingToken != "" {
-		w.Header().Set("X-Routing-Token", result.RoutingToken)
 	}
 	w.WriteHeader(result.StatusCode)
 	_, _ = w.Write(result.Body)

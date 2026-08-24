@@ -20,7 +20,6 @@ import (
 	"agentbox/internal/common"
 	"agentbox/internal/config"
 	"agentbox/internal/controller"
-	"agentbox/internal/imagebuilder"
 	"agentbox/internal/logging"
 )
 
@@ -29,14 +28,14 @@ import (
 // dependencies — main() shouldn't interleave os.Getenv calls with
 // constructing the service.
 type Config struct {
-	RedisAddr          string
-	ListenAddr         string
-	RoutingTokenSecret config.Secret
-	IdleReaperInterval time.Duration
-	DataDir            string
-	HostAgents         string // raw "host-1=addr1,host-2=addr2"; parsed by seedHostsFromEnv
-	LogLevel           string
-	LogFormat          string
+	RedisAddr           string
+	ListenAddr          string
+	IdleReaperInterval  time.Duration
+	HostAgents          string // raw "host-1=addr1,host-2=addr2"; parsed by seedHostsFromEnv
+	ImageBuilderURL     string
+	ImageBuilderTimeout time.Duration // covers a full build (pull+export+format+extract+inject) — see HTTPImageBuilderClient's doc comment
+	LogLevel            string
+	LogFormat           string
 }
 
 func loadConfig() (Config, error) {
@@ -45,19 +44,15 @@ func loadConfig() (Config, error) {
 
 	cfg.RedisAddr = config.String("REDIS_ADDR", "localhost:6379")
 	cfg.ListenAddr = config.String("LISTEN_ADDR", ":9090")
-	cfg.DataDir = config.String("DATA_DIR", "/data")
 	cfg.HostAgents = config.String("HOST_AGENTS", "")
+	cfg.ImageBuilderURL = config.String("IMAGE_BUILDER_URL", "http://localhost:9091")
 	cfg.LogLevel = config.String("LOG_LEVEL", "info")
 	cfg.LogFormat = config.String("LOG_FORMAT", "text")
 
-	// ROUTING_TOKEN_SECRET has no safe default: the Controller and REST API
-	// Service sign/verify routing tokens with this shared HMAC secret
-	// (§4.2), so a guessable or hardcoded fallback would let anyone forge
-	// a routing token. It must be provided explicitly.
-	if cfg.RoutingTokenSecret, err = config.RequiredSecret("ROUTING_TOKEN_SECRET"); err != nil {
-		return cfg, fmt.Errorf("load config: %w (must match the REST API Service's ROUTING_TOKEN_SECRET, §4.2 routing token contract)", err)
-	}
 	if cfg.IdleReaperInterval, err = config.Duration("IDLE_REAPER_INTERVAL", 30*time.Second); err != nil {
+		return cfg, fmt.Errorf("load config: %w", err)
+	}
+	if cfg.ImageBuilderTimeout, err = config.Duration("IMAGE_BUILDER_TIMEOUT", 120*time.Second); err != nil {
 		return cfg, fmt.Errorf("load config: %w", err)
 	}
 	return cfg, nil
@@ -84,18 +79,15 @@ func main() {
 	}
 
 	store := controller.NewStore(rdb)
-	tokens := controller.NewTokenIssuer([]byte(cfg.RoutingTokenSecret.Value()))
 	ha := controller.NewHTTPHostAgentClient()
 
-	// Image Builder (§4.6, Phase 2): real Docker/ext4 pipeline. Only
-	// functional where Docker and Linux mount privileges actually exist —
-	// not this dev machine, but the orchestration is fully unit-tested
-	// against fakes (internal/imagebuilder).
-	ibCfg := imagebuilder.DefaultConfig()
-	ibCfg.DataDir = cfg.DataDir
-	ib := imagebuilder.NewBuilder(imagebuilder.CLIDockerOps{}, imagebuilder.LinuxFilesystemOps{}, ibCfg)
+	// Image Builder (§4.6): a separate systemd-managed service (cmd/imagebuilder),
+	// not called in-process — it needs real mount/loop-device privileges that
+	// turned out to be genuinely unsafe to grant a container sharing the
+	// host's /dev. See HTTPImageBuilderClient's doc comment.
+	ib := controller.NewHTTPImageBuilderClient(cfg.ImageBuilderURL, cfg.ImageBuilderTimeout)
 
-	svc := controller.NewService(store, ha, tokens, ib)
+	svc := controller.NewService(store, ha, ib)
 
 	if err := seedHostsFromEnv(ctx, store, logger, cfg.HostAgents); err != nil {
 		logger.Error("failed to seed host registry from HOST_AGENTS", "error", err)

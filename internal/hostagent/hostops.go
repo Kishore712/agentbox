@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 )
 
 // NetworkInfo is what SetupNetwork hands back: the TAP device to attach to
@@ -68,6 +69,17 @@ type HostOps interface {
 	// used by both CreateSnapshot (suspend) and LoadSnapshot (resume).
 	SnapshotPaths(instanceID string) (snapshotPath, memFilePath string)
 
+	// PrepareSnapshotDir ensures SnapshotPaths' parent directory exists.
+	// Firecracker's own snapshot/create API writes directly to the paths
+	// it's given — it doesn't create missing parent directories itself, and
+	// nothing else in the boot/suspend flow creates a snapshot/
+	// subdirectory ahead of time. Confirmed against a real suspend attempt:
+	// without this, CreateSnapshot fails with a 400 from Firecracker before
+	// ever touching the filesystem. Resume doesn't need this — it's only
+	// reading files that must already exist, and their absence is the
+	// expected ErrSnapshotMissing case.
+	PrepareSnapshotDir(ctx context.Context, instanceID string) error
+
 	// SocketPath returns the deterministic Firecracker API socket path for
 	// an instance — lets SuspendVM/ResumeVM rebuild a FirecrackerClient for
 	// an already-running (or about-to-be-restarted) process without the
@@ -85,6 +97,20 @@ type HostOps interface {
 	// DeleteInstanceFiles removes /data/instances/{instanceID}/ entirely —
 	// the per-instance rootfs copy, home.ext4, snapshot/, and metadata.
 	DeleteInstanceFiles(ctx context.Context, instanceID string) error
+
+	// HasRootfs reports whether a golden rootfs already exists locally at
+	// rootfsPath. The Controller calls this (via VMManager.HasRootfs, over
+	// HTTP) before pushing one — §4.6's placement-locality fix: once
+	// Controller and the Host Agent can be on different machines, a
+	// workload's rootfs built by the Image Builder isn't automatically
+	// visible on whichever host actually runs an instance of it. Checked
+	// first so the (potentially large) transfer only happens once per
+	// (workload, host) pair, not on every instance creation.
+	HasRootfs(ctx context.Context, rootfsPath string) (bool, error)
+
+	// SaveRootfs writes rootfs.ext4 bytes to rootfsPath, creating parent
+	// directories as needed. Idempotent — overwrites if already present.
+	SaveRootfs(ctx context.Context, rootfsPath string, data io.Reader) error
 }
 
 // InstanceMetadata is the small bit of boot-time context the Host Agent
@@ -190,7 +216,14 @@ func (h *LinuxHostOps) CreateHomeVolume(ctx context.Context, instanceID string) 
 	if sizeMiB == 0 {
 		sizeMiB = 1024
 	}
-	if err := runCmd(ctx, "dd", "if=/dev/zero", "of="+dst, "bs=1M", fmt.Sprintf("count=%d", sizeMiB)); err != nil {
+	// truncate, not `dd if=/dev/zero`: mkfs.ext4 doesn't need the backing
+	// bytes to actually be written — a sparse file of the right size is
+	// enough, and skipping a real 1GiB(+) write is the difference between
+	// this taking milliseconds and taking however long the host's disk
+	// needs to sustain that write (pd-standard can make that genuinely
+	// slow — this was directly responsible for a real CreateInstance
+	// timeout during Tier 3 validation).
+	if err := runCmd(ctx, "truncate", "-s", fmt.Sprintf("%dM", sizeMiB), dst); err != nil {
 		return "", fmt.Errorf("allocate home.ext4: %w", err)
 	}
 	if err := runCmd(ctx, "mkfs.ext4", "-q", dst); err != nil {
@@ -285,6 +318,19 @@ func (h *LinuxHostOps) StartFirecrackerProcess(ctx context.Context, instanceID s
 	}
 	_ = os.Remove(sock) // stale socket from a previous run
 
+	// The guest's console=ttyS0 boot argument (manager.go's configureAndStart)
+	// only takes effect if something's listening on the other end — without
+	// this, a guest that panics or never brings up its network is
+	// indistinguishable from one that's still booting, since both just look
+	// like nothing answering on the guest port. Firecracker writes serial
+	// output straight to its own stdout/stderr with no extra API
+	// configuration needed, so capturing those to a file per instance is
+	// enough to see it.
+	consoleLog, err := os.Create(filepath.Join(h.instanceRootDir(instanceID), "console.log"))
+	if err != nil {
+		return "", fmt.Errorf("create console log: %w", err)
+	}
+
 	if h.jailerEnabled() {
 		// The jailer chroots the process before exec'ing it, so the
 		// --api-sock value passed to firecracker (after the "--"
@@ -292,20 +338,51 @@ func (h *LinuxHostOps) StartFirecrackerProcess(ctx context.Context, instanceID s
 		// see JailerConfig's caveat about this being unverified.
 		name, args := buildJailerCommand(*h.Jailer, h.FirecrackerBinary, instanceID, "api.sock")
 		cmd := exec.CommandContext(context.WithoutCancel(ctx), name, args...)
+		cmd.Stdout, cmd.Stderr = consoleLog, consoleLog
 		if err := cmd.Start(); err != nil {
+			consoleLog.Close()
 			return "", fmt.Errorf("start jailed firecracker process: %w", err)
 		}
-		return sock, nil
+		go func() { _ = cmd.Wait(); consoleLog.Close() }()
+		return sock, waitForSocket(ctx, sock)
 	}
 
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), h.FirecrackerBinary, "--api-sock", sock)
+	cmd.Stdout, cmd.Stderr = consoleLog, consoleLog
 	if err := cmd.Start(); err != nil {
+		consoleLog.Close()
 		return "", fmt.Errorf("start firecracker process: %w", err)
 	}
-	// Deliberately not waiting on cmd — it's a long-running process the
-	// Host Agent manages by instance id (via StopFirecrackerProcess), not
-	// by holding a live *exec.Cmd handle across suspend/resume boundaries.
-	return sock, nil
+	// Deliberately not waiting on cmd for lifecycle purposes — it's a
+	// long-running process the Host Agent manages by instance id (via
+	// StopFirecrackerProcess), not by holding a live *exec.Cmd handle across
+	// suspend/resume boundaries. This goroutine only exists to close
+	// consoleLog once the process actually exits, so the fd doesn't leak.
+	go func() { _ = cmd.Wait(); consoleLog.Close() }()
+	return sock, waitForSocket(ctx, sock)
+}
+
+// waitForSocket polls for the API socket Firecracker creates on startup —
+// cmd.Start() only confirms the process was exec'd, not that it's gotten far
+// enough to bind its API socket, and the caller's very next step is an API
+// call over that socket. Without this, that first call can race a
+// still-starting process and fail with a plain "no such file or directory"
+// that looks like a boot failure rather than the startup lag it actually is.
+func waitForSocket(ctx context.Context, sock string) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(sock); err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("firecracker API socket %s did not appear within 5s of starting the process", sock)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }
 
 func (h *LinuxHostOps) StopFirecrackerProcess(ctx context.Context, instanceID string) error {
@@ -325,6 +402,10 @@ func (h *LinuxHostOps) SnapshotPaths(instanceID string) (string, string) {
 	// instanceRootDir directly) to stay consistent with the disk layout
 	// documented in §3.1/§4.7, jailed or not.
 	return h.apiPath(instanceID, "snapshot/vmstate"), h.apiPath(instanceID, "snapshot/mem_file")
+}
+
+func (h *LinuxHostOps) PrepareSnapshotDir(ctx context.Context, instanceID string) error {
+	return os.MkdirAll(filepath.Join(h.instanceRootDir(instanceID), "snapshot"), 0o755)
 }
 
 func (h *LinuxHostOps) metadataPath(instanceID string) string {
@@ -358,6 +439,32 @@ func (h *LinuxHostOps) LoadInstanceMetadata(ctx context.Context, instanceID stri
 
 func (h *LinuxHostOps) DeleteInstanceFiles(ctx context.Context, instanceID string) error {
 	return os.RemoveAll(h.instanceRootDir(instanceID))
+}
+
+func (h *LinuxHostOps) HasRootfs(ctx context.Context, rootfsPath string) (bool, error) {
+	_, err := os.Stat(rootfsPath)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("stat rootfs: %w", err)
+}
+
+func (h *LinuxHostOps) SaveRootfs(ctx context.Context, rootfsPath string, data io.Reader) error {
+	if err := os.MkdirAll(filepath.Dir(rootfsPath), 0o755); err != nil {
+		return fmt.Errorf("create rootfs parent dir: %w", err)
+	}
+	f, err := os.Create(rootfsPath)
+	if err != nil {
+		return fmt.Errorf("create rootfs file: %w", err)
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, data); err != nil {
+		return fmt.Errorf("write rootfs data: %w", err)
+	}
+	return nil
 }
 
 func copyFile(src, dst string) error {

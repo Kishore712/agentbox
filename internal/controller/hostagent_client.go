@@ -28,4 +28,13 @@ type HostAgentClient interface {
 	SuspendVM(ctx context.Context, hostAddr, instanceID string) error
 	ResumeVM(ctx context.Context, hostAddr, instanceID string) (VMEndpoint, error)
 	DeleteVM(ctx context.Context, hostAddr, instanceID string) error
+
+	// HasRootfs and PushRootfs implement §4.6's placement-locality fix —
+	// called from CreateInstance before BootVM, so a workload's golden
+	// rootfs (built by the Image Builder, which runs inside the Controller
+	// process) actually exists on whichever host is about to boot an
+	// instance of it. rootfsRef is the exact path from the workload record
+	// — see Store's rootfs_ref field.
+	HasRootfs(ctx context.Context, hostAddr, rootfsRef string) (bool, error)
+	PushRootfs(ctx context.Context, hostAddr, rootfsRef string) error
 }

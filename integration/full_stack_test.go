@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,15 +20,15 @@ import (
 )
 
 const fullStackAPIKey = "full-stack-test-key"
-const fullStackTokenSecret = "full-stack-test-secret"
 
 // fullStackHarness wires all three real services together over real HTTP —
-// REST API Service -> Controller -> Host Agent — with only the pieces that
-// genuinely require Linux/KVM/a real guest app stubbed out: VM operations,
-// the Firecracker API itself, and the guest application the client's
-// request ultimately reaches. Everything else (auth, routing-token
-// issuance/verification, the resume-on-suspend fallback, all three
-// services' actual HTTP contracts) is exercised for real.
+// REST API Service -> Host Agent -> guest for the data plane, REST API
+// Service -> Controller -> Host Agent for the control plane — with only
+// the pieces that genuinely require Linux/KVM/a real guest app stubbed
+// out: VM operations, the Firecracker API itself, and the guest
+// application the client's request ultimately reaches. Everything else
+// (auth, the local routing cache, the resume-on-suspend fallback, all
+// three services' actual HTTP contracts) is exercised for real.
 type fullStackHarness struct {
 	t       *testing.T
 	apiURL  string
@@ -68,6 +69,7 @@ func newFullStackHarness(t *testing.T) *fullStackHarness {
 		func(string) hostagent.FirecrackerClient { return stubFirecrackerClient{} },
 		stubReadiness{},
 		hostagent.Config{KernelImagePath: "/data/vmlinux", GuestPort: mustAtoi(t, guestParts[1]), BootTimeout: time.Second},
+		hostagent.NewHTTPGuestProxy(5*time.Second), // real forward to the guest test server (§4.3)
 	)
 	haServer := httptest.NewServer(hostagent.NewRouter(mgr))
 	t.Cleanup(haServer.Close)
@@ -75,10 +77,9 @@ func newFullStackHarness(t *testing.T) *fullStackHarness {
 
 	// Controller: real HTTP server, real Redis, real HTTPHostAgentClient.
 	store := controller.NewStore(rdb)
-	tokens := controller.NewTokenIssuer([]byte(fullStackTokenSecret))
 	ha := controller.NewHTTPHostAgentClient()
-	ib := &stubImageBuilder{rootfsRef: "/data/workloads/full-stack/rootfs.ext4"}
-	ctrlSvc := controller.NewService(store, ha, tokens, ib)
+	ib := &stubImageBuilder{rootfsRef: filepath.Join(t.TempDir(), "rootfs.ext4")}
+	ctrlSvc := controller.NewService(store, ha, ib)
 	ctrlServer := httptest.NewServer(controller.NewRouter(ctrlSvc))
 	t.Cleanup(ctrlServer.Close)
 
@@ -89,11 +90,11 @@ func newFullStackHarness(t *testing.T) *fullStackHarness {
 	}
 
 	// REST API Service: real HTTP server, real HTTPControllerClient, real
-	// token verification against the same shared secret as the Controller.
-	apiCtrl := apiservice.NewHTTPControllerClient(ctrlServer.URL)
-	apiTokens := apiservice.NewTokenVerifier([]byte(fullStackTokenSecret))
-	apiProxy := apiservice.NewHTTPGuestProxy(5 * time.Second)
-	apiSvc := apiservice.NewService(apiCtrl, apiTokens, apiProxy)
+	// HTTPHostAgentProxy — it never dials the guest directly as of 3.2, it
+	// proxies through the Host Agent server above (§4.1/§4.3).
+	apiCtrl := apiservice.NewHTTPControllerClient(ctrlServer.URL, 60*time.Second)
+	apiProxy := apiservice.NewHTTPHostAgentProxy(5 * time.Second)
+	apiSvc := apiservice.NewService(apiCtrl, apiProxy, 0)
 	apiServer := httptest.NewServer(apiservice.NewRouter(apiSvc, fullStackAPIKey))
 	t.Cleanup(apiServer.Close)
 
@@ -198,14 +199,14 @@ func TestFullStack_CustomerNeverSeesA503(t *testing.T) {
 		t.Fatalf("cold invoke body = %q", body)
 	}
 	sessionID := resp.Header.Get("X-Session-Id")
-	token := resp.Header.Get("X-Routing-Token")
-	if sessionID == "" || token == "" {
-		t.Fatalf("expected X-Session-Id and X-Routing-Token headers, got session=%q token=%q", sessionID, token)
+	if sessionID == "" {
+		t.Fatalf("expected an X-Session-Id header, got none")
 	}
 
-	// 3. Warm invoke — token-routed, should not touch the Controller for
-	// routing at all.
-	resp = h.req(http.MethodGet, "/agents/"+agentID+"/invocation?session_id="+sessionID, map[string]string{"X-Routing-Token": token})
+	// 3. Warm invoke — routing-cache-routed (through the Host Agent, never
+	// a raw guest address), should not touch the Controller for routing at
+	// all.
+	resp = h.req(http.MethodGet, "/agents/"+agentID+"/invocation?session_id="+sessionID, nil)
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("warm invoke: got %d, body=%s", resp.StatusCode, b)
@@ -225,10 +226,13 @@ func TestFullStack_CustomerNeverSeesA503(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	// 5. Invoke again with the now-stale token. This is the core promise:
-	// the client must see a normal 200, never a 503, even though the
-	// session was suspended in between.
-	resp = h.postJSON("/agents/"+agentID+"/invocation?session_id="+sessionID, "", map[string]string{"X-Routing-Token": token})
+	// 5. Invoke again. The API Service's cached host_agent_addr is still
+	// the same host (suspend/resume never re-places), but the Host Agent
+	// itself now rejects the proxy call (the instance was deregistered
+	// from its live registry on suspend, §4.3) — forcing the resume
+	// fallback. This is the core promise: the client must see a normal
+	// 200, never a 503, even though the session was suspended in between.
+	resp = h.postJSON("/agents/"+agentID+"/invocation?session_id="+sessionID, "", nil)
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("invoke on suspended session: got %d (want 200 — the client must never see a 503), body=%s", resp.StatusCode, b)

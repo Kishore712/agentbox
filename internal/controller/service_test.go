@@ -22,10 +22,15 @@ type fakeHostAgent struct {
 	deleteCalls    int
 	nextGuestIP    string
 	nextGuestPort  int
+
+	hasRootfsResult bool // whether the host "already has" the rootfs — default true, so existing tests skip the push path
+	hasRootfsErr    error
+	pushRootfsErr   error
+	pushRootfsCalls []string // rootfsRef values pushed, for assertions
 }
 
 func newFakeHostAgent() *fakeHostAgent {
-	return &fakeHostAgent{nextGuestIP: "172.16.0.2", nextGuestPort: 8080}
+	return &fakeHostAgent{nextGuestIP: "172.16.0.2", nextGuestPort: 8080, hasRootfsResult: true}
 }
 
 func (f *fakeHostAgent) BootVM(ctx context.Context, hostAddr string, req BootVMRequest) (VMEndpoint, error) {
@@ -56,6 +61,20 @@ func (f *fakeHostAgent) DeleteVM(ctx context.Context, hostAddr, instanceID strin
 	return f.deleteErr
 }
 
+func (f *fakeHostAgent) HasRootfs(ctx context.Context, hostAddr, rootfsRef string) (bool, error) {
+	if f.hasRootfsErr != nil {
+		return false, f.hasRootfsErr
+	}
+	return f.hasRootfsResult, nil
+}
+
+func (f *fakeHostAgent) PushRootfs(ctx context.Context, hostAddr, rootfsRef string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pushRootfsCalls = append(f.pushRootfsCalls, rootfsRef)
+	return f.pushRootfsErr
+}
+
 type fakeImageBuilder struct {
 	err       error
 	rootfsRef string
@@ -83,8 +102,7 @@ func (f *fakeImageBuilder) Build(ctx context.Context, workloadID, imageRef strin
 func newTestService(t *testing.T, ha HostAgentClient, ib ImageBuilder) *Service {
 	t.Helper()
 	store := newTestStore(t) // real Redis, per store_test.go
-	tokens := NewTokenIssuer([]byte("test-secret"))
-	return NewService(store, ha, tokens, ib)
+	return NewService(store, ha, ib)
 }
 
 // createReadyWorkload registers a workload and blocks until its (fake)
@@ -184,18 +202,15 @@ func TestCreateInstance_Success(t *testing.T) {
 	if res.State != common.InstanceRunning {
 		t.Fatalf("state = %v, want RUNNING (error=%s)", res.State, res.Error)
 	}
-	if res.GuestIP != "172.16.0.2" || res.GuestPort != 8080 {
-		t.Errorf("endpoint = %s:%d, want 172.16.0.2:8080", res.GuestIP, res.GuestPort)
+	if res.HostAgentAddr != "host-1:9000" {
+		t.Errorf("host_agent_addr = %q, want host-1:9000", res.HostAgentAddr)
 	}
-	if res.RoutingToken == "" {
-		t.Error("expected a non-empty routing token")
-	}
-	claims, err := svc.tokens.Verify(res.RoutingToken)
+	inst, err := svc.store.GetInstance(context.Background(), res.InstanceID)
 	if err != nil {
-		t.Fatalf("issued token did not verify: %v", err)
+		t.Fatal(err)
 	}
-	if claims.InstanceID != res.InstanceID || claims.GuestIP != res.GuestIP {
-		t.Errorf("token claims %+v don't match result %+v", claims, res)
+	if inst.GuestIP != "172.16.0.2" || inst.GuestPort != 8080 {
+		t.Errorf("stored endpoint (observability only) = %s:%d, want 172.16.0.2:8080", inst.GuestIP, inst.GuestPort)
 	}
 
 	host, err := svc.store.GetHost(context.Background(), "host-1")
@@ -265,6 +280,78 @@ func TestCreateInstance_NoHealthyHost(t *testing.T) {
 	}
 	if res.Error == "" {
 		t.Error("expected a non-empty error reason")
+	}
+}
+
+// --- Placement-locality fix (§4.6): push the golden rootfs to a host that doesn't have it yet ---
+
+func TestCreateInstance_PushesRootfsWhenHostDoesNotHaveIt(t *testing.T) {
+	ib := newFakeImageBuilder()
+	ha := newFakeHostAgent()
+	ha.hasRootfsResult = false // simulates a host that's never run this workload before
+	svc := newTestService(t, ha, ib)
+	w := createReadyWorkload(t, svc, ib, 10)
+	registerHealthyHost(t, svc, "host-1")
+
+	res, err := svc.CreateInstance(context.Background(), w.WorkloadID)
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if res.State != common.InstanceRunning {
+		t.Fatalf("state = %v, want RUNNING (error=%s)", res.State, res.Error)
+	}
+	if len(ha.pushRootfsCalls) != 1 || ha.pushRootfsCalls[0] != w.RootfsRef {
+		t.Errorf("pushRootfsCalls = %v, want exactly one call with %q", ha.pushRootfsCalls, w.RootfsRef)
+	}
+}
+
+func TestCreateInstance_SkipsPushWhenHostAlreadyHasRootfs(t *testing.T) {
+	ib := newFakeImageBuilder()
+	ha := newFakeHostAgent() // hasRootfsResult defaults to true
+	svc := newTestService(t, ha, ib)
+	w := createReadyWorkload(t, svc, ib, 10)
+	registerHealthyHost(t, svc, "host-1")
+
+	if _, err := svc.CreateInstance(context.Background(), w.WorkloadID); err != nil {
+		t.Fatal(err)
+	}
+	if len(ha.pushRootfsCalls) != 0 {
+		t.Errorf("expected no push when the host already has the rootfs cached, got %v", ha.pushRootfsCalls)
+	}
+}
+
+func TestCreateInstance_RootfsCacheCheckFailureFailsInstance(t *testing.T) {
+	ib := newFakeImageBuilder()
+	ha := newFakeHostAgent()
+	ha.hasRootfsErr = errors.New("host agent unreachable")
+	svc := newTestService(t, ha, ib)
+	w := createReadyWorkload(t, svc, ib, 10)
+	registerHealthyHost(t, svc, "host-1")
+
+	res, err := svc.CreateInstance(context.Background(), w.WorkloadID)
+	if err != nil {
+		t.Fatalf("unexpected error (should return a FAILED result): %v", err)
+	}
+	if res.State != common.InstanceFailed {
+		t.Errorf("state = %v, want FAILED", res.State)
+	}
+}
+
+func TestCreateInstance_RootfsPushFailureFailsInstance(t *testing.T) {
+	ib := newFakeImageBuilder()
+	ha := newFakeHostAgent()
+	ha.hasRootfsResult = false
+	ha.pushRootfsErr = errors.New("disk full on host")
+	svc := newTestService(t, ha, ib)
+	w := createReadyWorkload(t, svc, ib, 10)
+	registerHealthyHost(t, svc, "host-1")
+
+	res, err := svc.CreateInstance(context.Background(), w.WorkloadID)
+	if err != nil {
+		t.Fatalf("unexpected error (should return a FAILED result): %v", err)
+	}
+	if res.State != common.InstanceFailed {
+		t.Errorf("state = %v, want FAILED", res.State)
 	}
 }
 
@@ -391,8 +478,12 @@ func TestResumeInstance_Success(t *testing.T) {
 	if res.State != common.InstanceRunning {
 		t.Fatalf("state = %v, want RUNNING (error=%s)", res.State, res.Error)
 	}
-	if res.GuestIP != "172.16.0.9" {
-		t.Errorf("guest_ip = %s, want the refreshed 172.16.0.9", res.GuestIP)
+	inst, err := svc.store.GetInstance(ctx, created.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.GuestIP != "172.16.0.9" {
+		t.Errorf("stored guest_ip (observability only) = %s, want the refreshed 172.16.0.9", inst.GuestIP)
 	}
 	host, err := svc.store.GetHost(ctx, "host-1")
 	if err != nil {
@@ -425,8 +516,8 @@ func TestResumeInstance_IdempotentWhenAlreadyRunning(t *testing.T) {
 	if res.State != common.InstanceRunning {
 		t.Errorf("state = %v, want RUNNING", res.State)
 	}
-	if res.RoutingToken == "" {
-		t.Error("expected a fresh routing token even on the idempotent path")
+	if res.HostAgentAddr == "" {
+		t.Error("expected a non-empty host_agent_addr even on the idempotent path")
 	}
 }
 

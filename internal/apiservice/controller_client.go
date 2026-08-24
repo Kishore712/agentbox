@@ -49,16 +49,15 @@ type Instance struct {
 
 // InstanceResult mirrors the Controller's CreateInstance/ResumeInstance
 // response body (§4.2) — either routing info (RUNNING) or an error reason
-// (FAILED).
+// (FAILED). host_agent_addr, not guest_ip/guest_port: this service never
+// resolves an instance to a live guest address itself — the Host Agent
+// does that, from its own live registry, at proxy time (§4.3).
 type InstanceResult struct {
-	InstanceID   string `json:"instance_id"`
-	State        string `json:"state"`
-	HostID       string `json:"host_id"`
-	GuestIP      string `json:"guest_ip"`
-	GuestPort    int    `json:"guest_port"`
-	RoutingToken string `json:"routing_token"`
-	TokenExp     int64  `json:"token_exp"`
-	Error        string `json:"error"`
+	InstanceID    string `json:"instance_id"`
+	State         string `json:"state"`
+	HostID        string `json:"host_id"`
+	HostAgentAddr string `json:"host_agent_addr"`
+	Error         string `json:"error"`
 }
 
 const (
@@ -97,8 +96,16 @@ type HTTPControllerClient struct {
 	client  *http.Client
 }
 
-func NewHTTPControllerClient(baseURL string) *HTTPControllerClient {
-	return &HTTPControllerClient{baseURL: baseURL, client: &http.Client{Timeout: 15 * time.Second}}
+// timeout must be generous enough to cover a cold CreateInstance: the
+// Controller may need to push a workload's golden rootfs to a Host Agent
+// that's never seen it before (§4.6) before BootVM even starts, and a slow
+// disk on the Host Agent's end (e.g. pd-standard) can make the volume-setup
+// steps inside that legitimately take several seconds. A too-tight timeout
+// here doesn't just fail this call — canceling it cancels the Host Agent's
+// still-in-flight work too (its request context is tied to this
+// connection), which is a worse failure than just waiting longer.
+func NewHTTPControllerClient(baseURL string, timeout time.Duration) *HTTPControllerClient {
+	return &HTTPControllerClient{baseURL: baseURL, client: &http.Client{Timeout: timeout}}
 }
 
 type controllerAPIError struct {

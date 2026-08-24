@@ -42,6 +42,13 @@ func BuildInitScript(entrypoint []string) (string, error) {
 # networking is already configured by the kernel's own ip= boot argument —
 # nothing to do here for that.
 set -e
+# /proc isn't mounted automatically (unlike /dev, which the kernel mounts
+# itself via devtmpfs) — needed below to read the Squid proxy address off
+# the kernel command line. Without it, that read fails, and since this
+# script runs as PID 1 under set -e, the failure exits init itself, which
+# the kernel treats as fatal ("Attempted to kill init!") — confirmed against
+# a real boot: the guest panicked here before ever reaching the entrypoint.
+mount -t proc proc /proc
 mkdir -p %s
 mount -t ext4 /dev/vdb %s
 export HOME=%s

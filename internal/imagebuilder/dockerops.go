@@ -111,10 +111,17 @@ func (CLIDockerOps) ExportImageFilesystem(ctx context.Context, imageRef, destTar
 }
 
 func runCmd(ctx context.Context, name string, args ...string) error {
+	_, err := runCmdOutput(ctx, name, args...)
+	return err
+}
+
+// runCmdOutput is runCmd plus stdout, for callers that need the command's
+// output (e.g. losetup -f --show reporting which device it attached).
+func runCmdOutput(ctx context.Context, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s %v: %w (output: %s)", name, args, err, string(out))
+		return "", fmt.Errorf("%s %v: %w (output: %s)", name, args, err, string(out))
 	}
-	return nil
+	return string(out), nil
 }

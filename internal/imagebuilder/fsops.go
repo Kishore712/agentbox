@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // FilesystemOps abstracts the Linux-only ext4 packing operations (mount
@@ -37,7 +38,12 @@ func (LinuxFilesystemOps) CreateSizedExt4(ctx context.Context, path string, size
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	if err := runCmd(ctx, "dd", "if=/dev/zero", "of="+path, "bs=1M", fmt.Sprintf("count=%d", sizeMiB)); err != nil {
+	// truncate, not `dd if=/dev/zero`: mkfs.ext4 doesn't need the backing
+	// bytes actually written — a sparse file of the right size is enough,
+	// and for a golden rootfs (often hundreds of MiB to a few GiB) a real
+	// write is real latency on slower disks for no benefit. Same fix as
+	// hostagent's CreateHomeVolume, same reason.
+	if err := runCmd(ctx, "truncate", "-s", fmt.Sprintf("%dM", sizeMiB), path); err != nil {
 		return err
 	}
 	return runCmd(ctx, "mkfs.ext4", "-q", path)
@@ -47,11 +53,41 @@ func (LinuxFilesystemOps) MountExt4(ctx context.Context, imagePath, mountPoint s
 	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
 		return err
 	}
-	return runCmd(ctx, "mount", "-o", "loop", imagePath, mountPoint)
+	// `mount -o loop` bundles "find a free loop device" and "attach + mount
+	// it" into one call, and its free-device selection isn't safe against
+	// concurrent use of the same loop-control (e.g. other loop users
+	// elsewhere on a host whose /dev is shared into this container) — it can
+	// report failure (exit 32, "already mounted or mount point busy") even
+	// though the mount actually went through underneath it. `losetup -f
+	// --show` is the hardened equivalent of that first step alone, so do the
+	// attach and the mount as two explicit calls instead.
+	loopDev, err := runCmdOutput(ctx, "losetup", "-f", "--show", imagePath)
+	if err != nil {
+		return fmt.Errorf("attach loop device: %w", err)
+	}
+	loopDev = strings.TrimSpace(loopDev)
+	if err := runCmd(ctx, "mount", loopDev, mountPoint); err != nil {
+		_ = runCmd(context.WithoutCancel(ctx), "losetup", "-d", loopDev)
+		return err
+	}
+	return nil
 }
 
 func (LinuxFilesystemOps) UnmountExt4(ctx context.Context, mountPoint string) error {
-	return runCmd(ctx, "umount", mountPoint)
+	// Capture the backing loop device before unmounting (once unmounted,
+	// nothing ties mountPoint back to it) so it can be explicitly detached —
+	// `umount` alone doesn't guarantee autoclear runs synchronously, and a
+	// lingering attachment is exactly what caused the mount race this
+	// function's sibling (MountExt4) works around.
+	loopDev, _ := runCmdOutput(ctx, "findmnt", "-n", "-o", "SOURCE", "--target", mountPoint)
+	loopDev = strings.TrimSpace(loopDev)
+	if err := runCmd(ctx, "umount", mountPoint); err != nil {
+		return err
+	}
+	if loopDev != "" {
+		_ = runCmd(ctx, "losetup", "-d", loopDev)
+	}
+	return nil
 }
 
 func (LinuxFilesystemOps) ExtractTar(ctx context.Context, tarPath, destDir string) error {
@@ -62,6 +98,18 @@ func (LinuxFilesystemOps) InjectInit(ctx context.Context, mountedRootDir string,
 	initPath := filepath.Join(mountedRootDir, "sbin", "init")
 	if err := os.MkdirAll(filepath.Dir(initPath), 0o755); err != nil {
 		return err
+	}
+	// Base images commonly ship /sbin/init as a symlink (Alpine/BusyBox:
+	// /sbin/init -> /bin/busybox) — os.WriteFile follows symlinks like any
+	// open(2)-based write, and since that target is an *absolute* path, a
+	// non-chrooted process resolves it against its own real root, not the
+	// mounted rootfs. Confirmed against a real build: this silently escaped
+	// the mount entirely and overwrote the host's own /bin/busybox instead
+	// of the guest's. Removing whatever's at initPath first — symlink or
+	// not — guarantees the write below creates a fresh regular file inside
+	// the mount, never follows a pre-existing symlink out of it.
+	if err := os.Remove(initPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove existing entry at %s before injecting init: %w", initPath, err)
 	}
 	return os.WriteFile(initPath, []byte(script), 0o755)
 }

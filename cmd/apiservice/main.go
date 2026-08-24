@@ -22,13 +22,14 @@ import (
 // Config holds every environment-derived setting the REST API Service
 // needs, loaded once in loadConfig rather than scattered across main().
 type Config struct {
-	ListenAddr         string
-	ControllerURL      string
-	APIKey             config.Secret
-	RoutingTokenSecret config.Secret
-	GuestProxyTimeout  time.Duration
-	LogLevel           string
-	LogFormat          string
+	ListenAddr        string
+	ControllerURL     string
+	APIKey            config.Secret
+	ControllerTimeout time.Duration // this service → Controller — must cover a cold CreateInstance (rootfs push + boot), not just a fast status read
+	HostAgentTimeout  time.Duration // this service → Host Agent's data-plane proxy endpoint (§4.3)
+	RoutingCacheTTL   time.Duration // local session_id → host_agent_addr cache (§4.1) — memory bound only, not correctness
+	LogLevel          string
+	LogFormat         string
 }
 
 func loadConfig() (Config, error) {
@@ -40,18 +41,20 @@ func loadConfig() (Config, error) {
 	cfg.LogLevel = config.String("LOG_LEVEL", "info")
 	cfg.LogFormat = config.String("LOG_FORMAT", "text")
 
-	// API_KEY (§8: single static key for the prototype) and
-	// ROUTING_TOKEN_SECRET are both credentials with no safe default —
-	// a hardcoded fallback for either would be a real vulnerability, not
-	// just a convenience. Both are required, and both are Secrets so they
-	// can't accidentally end up in a log line.
+	// API_KEY (§8: single static key for the prototype) has no safe
+	// default — a hardcoded fallback would be a real vulnerability, not
+	// just a convenience. It's a Secret so it can't accidentally end up in
+	// a log line.
 	if cfg.APIKey, err = config.RequiredSecret("API_KEY"); err != nil {
 		return cfg, fmt.Errorf("load config: %w (§8: single static key for the prototype)", err)
 	}
-	if cfg.RoutingTokenSecret, err = config.RequiredSecret("ROUTING_TOKEN_SECRET"); err != nil {
-		return cfg, fmt.Errorf("load config: %w (must match the Controller's ROUTING_TOKEN_SECRET, §4.2 routing token contract)", err)
+	if cfg.ControllerTimeout, err = config.Duration("CONTROLLER_TIMEOUT", 60*time.Second); err != nil {
+		return cfg, fmt.Errorf("load config: %w", err)
 	}
-	if cfg.GuestProxyTimeout, err = config.Duration("GUEST_PROXY_TIMEOUT", 30*time.Second); err != nil {
+	if cfg.HostAgentTimeout, err = config.Duration("HOST_AGENT_PROXY_TIMEOUT", 30*time.Second); err != nil {
+		return cfg, fmt.Errorf("load config: %w", err)
+	}
+	if cfg.RoutingCacheTTL, err = config.Duration("ROUTING_CACHE_TTL", 10*time.Minute); err != nil {
 		return cfg, fmt.Errorf("load config: %w", err)
 	}
 	return cfg, nil
@@ -66,10 +69,9 @@ func main() {
 	logger := logging.New(cfg.LogLevel, cfg.LogFormat)
 	slog.SetDefault(logger)
 
-	ctrl := apiservice.NewHTTPControllerClient(cfg.ControllerURL)
-	tokens := apiservice.NewTokenVerifier([]byte(cfg.RoutingTokenSecret.Value()))
-	proxy := apiservice.NewHTTPGuestProxy(cfg.GuestProxyTimeout)
-	svc := apiservice.NewService(ctrl, tokens, proxy)
+	ctrl := apiservice.NewHTTPControllerClient(cfg.ControllerURL, cfg.ControllerTimeout)
+	proxy := apiservice.NewHTTPHostAgentProxy(cfg.HostAgentTimeout)
+	svc := apiservice.NewService(ctrl, proxy, cfg.RoutingCacheTTL)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

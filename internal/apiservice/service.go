@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // ErrSessionIDRequired: GET never implicitly creates a session (§4.1) — if
@@ -20,18 +21,18 @@ type SessionFailedError struct {
 
 func (e *SessionFailedError) Error() string { return "session failed: " + e.Reason }
 
-// Service implements §4.1's core behavior. Holds no state of its own —
-// every read and every invocation goes through ControllerClient; the only
-// local computation is routing-token verification and proxying to the
-// guest.
+// Service implements §4.1's core behavior. Holds no durable state of its
+// own — every read and every invocation goes through ControllerClient. The
+// one piece of local state is the routing cache (§4.1) — ephemeral,
+// rebuildable, never authoritative.
 type Service struct {
-	ctrl   ControllerClient
-	tokens *TokenVerifier
-	proxy  GuestProxy
+	ctrl  ControllerClient
+	proxy HostAgentProxy
+	cache *routingCache
 }
 
-func NewService(ctrl ControllerClient, tokens *TokenVerifier, proxy GuestProxy) *Service {
-	return &Service{ctrl: ctrl, tokens: tokens, proxy: proxy}
+func NewService(ctrl ControllerClient, proxy HostAgentProxy, cacheTTL time.Duration) *Service {
+	return &Service{ctrl: ctrl, proxy: proxy, cache: newRoutingCache(cacheTTL)}
 }
 
 // --- Agent (Workload facade) ---
@@ -51,24 +52,35 @@ func (svc *Service) DeleteAgent(ctx context.Context, agentID string) error {
 // --- Session (Instance facade) ---
 
 func (svc *Service) CreateSession(ctx context.Context, agentID string) (*InstanceResult, error) {
-	return svc.ctrl.CreateInstance(ctx, agentID)
+	res, err := svc.ctrl.CreateInstance(ctx, agentID)
+	if err != nil {
+		return nil, err
+	}
+	if res.State == StateRunning {
+		svc.cache.set(res.InstanceID, res.HostID, res.HostAgentAddr)
+	}
+	return res, nil
 }
 
 func (svc *Service) GetSession(ctx context.Context, sessionID string) (*Instance, error) {
 	return svc.ctrl.GetInstance(ctx, sessionID)
 }
 
+// DeleteSession evicts the routing cache entry immediately, rather than
+// waiting for a proxy call to eventually fail — the session is gone the
+// moment the client asked for it to be, no reason to keep routing to it in
+// the meantime.
 func (svc *Service) DeleteSession(ctx context.Context, sessionID string) error {
+	svc.cache.evict(sessionID)
 	return svc.ctrl.DeleteInstance(ctx, sessionID)
 }
 
 // --- Invocation ---
 
 type InvokeRequest struct {
-	Method       string
-	SessionID    string // "" means implicit create — only valid for POST
-	RoutingToken string // from the X-Routing-Token request header, may be empty
-	Header       http.Header
+	Method    string
+	SessionID string // "" means implicit create — only valid for POST
+	Header    http.Header
 	// Body is buffered in full by the caller (the HTTP handler) rather than
 	// streamed, specifically so it can be replayed if the direct-proxy
 	// attempt fails partway through and Invoke falls back to
@@ -81,18 +93,18 @@ type InvokeRequest struct {
 }
 
 type InvokeResult struct {
-	StatusCode   int
-	Header       http.Header
-	Body         []byte
-	SessionID    string // set only when a new/refreshed session id should be reported (X-Session-Id)
-	RoutingToken string // set whenever a (possibly refreshed) token should be reported (X-Routing-Token)
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+	SessionID  string // set only when a new session id should be reported (X-Session-Id)
 }
 
 // Invoke implements §4.1's "Core behavior on invocation" in full: implicit
-// creation on POST with no session_id, local token verification on the
-// warm path (zero Controller round trip), and a resume fallback whenever
-// routing can't be resolved locally — the client never sees a 503 for
-// suspend/resume, that dance is entirely internal.
+// creation on POST with no session_id, a local routing-cache hit on the
+// warm path (zero Controller round trip, and the Host Agent — never this
+// service — resolves the live guest address), and a resume fallback
+// whenever routing can't be resolved locally — the client never sees a 503
+// for suspend/resume, that dance is entirely internal.
 func (svc *Service) Invoke(ctx context.Context, agentID string, req InvokeRequest) (*InvokeResult, error) {
 	if req.SessionID == "" {
 		if req.Method != http.MethodPost {
@@ -105,40 +117,42 @@ func (svc *Service) Invoke(ctx context.Context, agentID string, req InvokeReques
 		if res.State == StateFailed {
 			return nil, &SessionFailedError{Reason: res.Error}
 		}
-		return svc.proxyAndBuildResult(ctx, res, req, true)
+		svc.cache.set(res.InstanceID, res.HostID, res.HostAgentAddr)
+		return svc.proxyAndBuildResult(ctx, res.InstanceID, res.HostAgentAddr, req, true)
 	}
 
-	// Warm path: verify the token locally, no Controller call at all, if
-	// it's valid and actually belongs to this session_id.
-	if claims, err := svc.tokens.Verify(req.RoutingToken); err == nil && claims.InstanceID == req.SessionID {
-		result, proxyErr := svc.tryProxyDirect(ctx, claims.GuestIP, claims.GuestPort, req)
+	// Warm path: cache hit, zero Controller round trip. The Host Agent
+	// resolves instance_id to a live guest address itself (§4.3) — this
+	// service never sees or caches one.
+	if hostAgentAddr, ok := svc.cache.get(req.SessionID); ok {
+		result, proxyErr := svc.tryProxyDirect(ctx, hostAgentAddr, req.SessionID, req)
 		if proxyErr == nil {
 			svc.ctrl.Heartbeat(ctx, req.SessionID) // async, sampled — never blocks the response
-			result.SessionID = ""                  // unchanged, no need to re-announce it
-			result.RoutingToken = req.RoutingToken // unchanged, still valid
 			return result, nil
 		}
-		// Direct connection failed despite a valid token (host rebooted,
-		// process crashed, etc.) — don't trust a token proven wrong in
-		// practice; fall through to the resume fallback below.
+		// The Host Agent rejected the call (registry miss — likely
+		// suspended — or the guest itself was unreachable, §4.3). Don't
+		// trust a cache entry proven wrong in practice; fall through.
 	}
 
-	// Fallback: token missing/expired/invalid, or a direct hit failed.
-	// ResumeInstance is idempotent — safe to call even if the instance
-	// turns out to still be RUNNING (§4.2), so this single path covers
-	// both "genuinely suspended" and "we just lost track of routing info."
+	// Fallback: cache miss, or the Host Agent call failed. ResumeInstance
+	// is idempotent — safe to call even if the instance turns out to still
+	// be RUNNING (§4.2), so this single path covers both "genuinely
+	// suspended" and "we just lost track of routing info."
 	res, err := svc.ctrl.ResumeInstance(ctx, req.SessionID)
 	if err != nil {
 		return nil, err
 	}
 	if res.State == StateFailed {
+		svc.cache.evict(req.SessionID)
 		return nil, &SessionFailedError{Reason: res.Error}
 	}
-	return svc.proxyAndBuildResult(ctx, res, req, false)
+	svc.cache.set(res.InstanceID, res.HostID, res.HostAgentAddr)
+	return svc.proxyAndBuildResult(ctx, res.InstanceID, res.HostAgentAddr, req, false)
 }
 
-func (svc *Service) tryProxyDirect(ctx context.Context, guestIP string, guestPort int, req InvokeRequest) (*InvokeResult, error) {
-	presp, err := svc.proxy.Forward(ctx, guestIP, guestPort, &ProxyRequest{Method: req.Method, Header: req.Header, Body: bytes.NewReader(req.Body)})
+func (svc *Service) tryProxyDirect(ctx context.Context, hostAgentAddr, instanceID string, req InvokeRequest) (*InvokeResult, error) {
+	presp, err := svc.proxy.Forward(ctx, hostAgentAddr, instanceID, &ProxyRequest{Method: req.Method, Header: req.Header, Body: bytes.NewReader(req.Body)})
 	if err != nil {
 		return nil, err
 	}
@@ -146,22 +160,17 @@ func (svc *Service) tryProxyDirect(ctx context.Context, guestIP string, guestPor
 }
 
 // proxyAndBuildResult is the shared tail of the implicit-create and
-// resume-fallback paths: proxy to the (possibly new) guest endpoint, and
-// report the routing token back to the client — always refreshed here,
-// whether newly issued (create) or re-issued (resume). session_id is only
-// announced on create (announceSessionID=true): the client already knows
-// it on the resume path, since they supplied it themselves.
-func (svc *Service) proxyAndBuildResult(ctx context.Context, res *InstanceResult, req InvokeRequest, announceSessionID bool) (*InvokeResult, error) {
-	presp, err := svc.proxy.Forward(ctx, res.GuestIP, res.GuestPort, &ProxyRequest{Method: req.Method, Header: req.Header, Body: bytes.NewReader(req.Body)})
+// resume-fallback paths: proxy through the owning Host Agent, and report
+// session_id back only on create (announceSessionID=true) — the client
+// already knows it on the resume path, since they supplied it themselves.
+func (svc *Service) proxyAndBuildResult(ctx context.Context, instanceID, hostAgentAddr string, req InvokeRequest, announceSessionID bool) (*InvokeResult, error) {
+	presp, err := svc.proxy.Forward(ctx, hostAgentAddr, instanceID, &ProxyRequest{Method: req.Method, Header: req.Header, Body: bytes.NewReader(req.Body)})
 	if err != nil {
-		return nil, fmt.Errorf("guest unreachable immediately after create/resume: %w", err)
+		return nil, fmt.Errorf("host agent unreachable immediately after create/resume: %w", err)
 	}
-	result := &InvokeResult{
-		StatusCode: presp.StatusCode, Header: presp.Header, Body: presp.Body,
-		RoutingToken: res.RoutingToken,
-	}
+	result := &InvokeResult{StatusCode: presp.StatusCode, Header: presp.Header, Body: presp.Body}
 	if announceSessionID {
-		result.SessionID = res.InstanceID
+		result.SessionID = instanceID
 	}
 	return result, nil
 }

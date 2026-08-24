@@ -1,4 +1,4 @@
-package apiservice
+package hostagent
 
 import (
 	"context"
@@ -9,9 +9,11 @@ import (
 )
 
 // ProxyRequest/ProxyResponse are the minimal shape needed to forward a
-// client's invoke request to a guest and relay its response back
-// (§4.1: "full request/response passthrough — method, headers minus
-// hop-by-hop, body").
+// request to a guest and relay its response back — identical in shape to
+// what the REST API Service used to do directly against a guest before
+// 3.2 moved this behind the Host Agent (design doc §4.1/§4.3). The two
+// services never share Go types, so this is a deliberate duplicate of
+// apiservice's version, not an import.
 type ProxyRequest struct {
 	Method string
 	Header http.Header
@@ -30,12 +32,10 @@ var hopByHopHeaders = []string{
 	"Te", "Trailer", "Transfer-Encoding", "Upgrade",
 }
 
-// GuestProxy forwards an invoke request directly to a guest microVM — the
-// data-plane path that never touches the Controller (§3.1/§4.1). Interface
-// so invoke logic can be unit tested against a fake guest, without a real
-// microVM. Every invocation hits a single fixed path on the guest ("/"),
-// matching the design's RPC-style single doorway rather than a
-// path-preserving reverse proxy.
+// GuestProxy is the actual last-hop HTTP forwarding to a specific
+// guest_ip:guest_port — the mechanics, kept separate from VMManager.Proxy
+// (which resolves instance_id → guest_ip:port via the live registry) so
+// VMManager's own tests can keep using fakes with zero real HTTP involved.
 type GuestProxy interface {
 	Forward(ctx context.Context, guestIP string, guestPort int, req *ProxyRequest) (*ProxyResponse, error)
 }
@@ -48,6 +48,9 @@ func NewHTTPGuestProxy(timeout time.Duration) *HTTPGuestProxy {
 	return &HTTPGuestProxy{client: &http.Client{Timeout: timeout}}
 }
 
+// Forward hits the guest's single fixed doorway ("/") — matching the
+// platform's RPC-style convention (§4.1), not a path-preserving reverse
+// proxy.
 func (p *HTTPGuestProxy) Forward(ctx context.Context, guestIP string, guestPort int, req *ProxyRequest) (*ProxyResponse, error) {
 	url := fmt.Sprintf("http://%s:%d/", guestIP, guestPort)
 	httpReq, err := http.NewRequestWithContext(ctx, req.Method, url, req.Body)
@@ -65,9 +68,11 @@ func (p *HTTPGuestProxy) Forward(ctx context.Context, guestIP string, guestPort 
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		// Connection-level failure — this is the signal callers use to
-		// distinguish "guest unreachable" (fall back to resume) from a
-		// normal error response the guest app itself returned.
+		// Connection-level failure — distinct from the registry-miss case
+		// (ErrInstanceNotRegistered in manager.go): the instance IS
+		// registered here, but the guest itself didn't answer. The HTTP
+		// layer maps this to 502, not 404 (design doc §4.3, "Flow —
+		// Data-plane proxy" step 4).
 		return nil, fmt.Errorf("guest unreachable: %w", err)
 	}
 	defer resp.Body.Close()

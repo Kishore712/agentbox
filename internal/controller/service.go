@@ -35,10 +35,9 @@ type ImageBuilder interface {
 type buildHook func()
 
 type Service struct {
-	store  *Store
-	ha     HostAgentClient
-	tokens *TokenIssuer
-	ib     ImageBuilder
+	store *Store
+	ha    HostAgentClient
+	ib    ImageBuilder
 
 	// round-robin placement cursor (§4.2: "v1: round-robin over a static,
 	// config-driven list"). A single Controller process owns this in
@@ -48,8 +47,8 @@ type Service struct {
 	onBuildStarted buildHook // test hook only
 }
 
-func NewService(store *Store, ha HostAgentClient, tokens *TokenIssuer, ib ImageBuilder) *Service {
-	return &Service{store: store, ha: ha, tokens: tokens, ib: ib}
+func NewService(store *Store, ha HostAgentClient, ib ImageBuilder) *Service {
+	return &Service{store: store, ha: ha, ib: ib}
 }
 
 // --- Workload ---
@@ -138,16 +137,17 @@ func (svc *Service) runDeleteWorkload(ctx context.Context, workloadID string) {
 // --- Instance ---
 
 // InstanceResult mirrors the JSON bodies in §4.2's CreateInstance/
-// ResumeInstance responses.
+// ResumeInstance responses. Deliberately carries HostAgentAddr, never
+// GuestIP/GuestPort — those never leave the Host Agent that owns the
+// instance (§4.3's live registry is the sole routing-authoritative source;
+// see the design doc's 3.1→3.2 changelog for why a client-facing routing
+// token pointing at a guest IP was removed).
 type InstanceResult struct {
-	InstanceID   string
-	State        common.InstanceState
-	HostID       string
-	GuestIP      string
-	GuestPort    int
-	RoutingToken string
-	TokenExp     int64
-	Error        string
+	InstanceID    string
+	State         common.InstanceState
+	HostID        string
+	HostAgentAddr string
+	Error         string
 }
 
 // CreateInstance implements §4.2 Flow — CreateInstance. Synchronous:
@@ -181,6 +181,10 @@ func (svc *Service) CreateInstance(ctx context.Context, workloadID string) (*Ins
 		return svc.failInstance(ctx, instanceID, common.InstanceCreating, err)
 	}
 
+	if err := svc.ensureRootfsOnHost(ctx, host.InternalAddr, w.RootfsRef); err != nil {
+		return svc.failInstance(ctx, instanceID, common.InstanceCreating, err)
+	}
+
 	ep, err := svc.ha.BootVM(ctx, host.InternalAddr, BootVMRequest{
 		InstanceID:      instanceID,
 		RootfsRef:       w.RootfsRef,
@@ -192,7 +196,29 @@ func (svc *Service) CreateInstance(ctx context.Context, workloadID string) (*Ins
 		return svc.failInstance(ctx, instanceID, common.InstanceCreating, err)
 	}
 
-	return svc.finishBootOrResume(ctx, instanceID, common.InstanceCreating, host.HostID, ep, w.IdleTimeoutSeconds)
+	return svc.finishBootOrResume(ctx, instanceID, common.InstanceCreating, host.HostID, host.InternalAddr, ep, w.IdleTimeoutSeconds)
+}
+
+// ensureRootfsOnHost implements §4.6's placement-locality fix: pushes the
+// workload's golden rootfs to hostAddr if it isn't already cached there.
+// Checked first, not pushed unconditionally — the Image Builder runs
+// inside the Controller process, so once Controller and a Host Agent can
+// be on separate machines (as of the two-VM deployment), a workload's
+// rootfs isn't automatically visible on whatever host actually boots an
+// instance of it. The check keeps the (potentially large) transfer to
+// once per (workload, host) pair rather than once per instance.
+func (svc *Service) ensureRootfsOnHost(ctx context.Context, hostAddr, rootfsRef string) error {
+	has, err := svc.ha.HasRootfs(ctx, hostAddr, rootfsRef)
+	if err != nil {
+		return fmt.Errorf("check host rootfs cache: %w", err)
+	}
+	if has {
+		return nil
+	}
+	if err := svc.ha.PushRootfs(ctx, hostAddr, rootfsRef); err != nil {
+		return fmt.Errorf("push rootfs to host: %w", err)
+	}
+	return nil
 }
 
 func (svc *Service) GetInstance(ctx context.Context, instanceID string) (*common.Instance, error) {
@@ -258,7 +284,7 @@ func (svc *Service) ResumeInstance(ctx context.Context, instanceID string) (*Ins
 		case "":
 			return nil, ErrNotFound
 		case common.InstanceRunning:
-			return svc.currentResultWithFreshToken(ctx, instanceID)
+			return svc.currentResult(ctx, instanceID)
 		case common.InstanceResuming:
 			return svc.waitForResumeToSettle(ctx, instanceID)
 		default:
@@ -299,26 +325,26 @@ func (svc *Service) ResumeInstance(ctx context.Context, instanceID string) (*Ins
 		return nil, err
 	}
 
-	return svc.finishBootOrResume(ctx, instanceID, common.InstanceResuming, inst.HostID, ep, w.IdleTimeoutSeconds)
+	return svc.finishBootOrResume(ctx, instanceID, common.InstanceResuming, inst.HostID, host.InternalAddr, ep, w.IdleTimeoutSeconds)
 }
 
-func (svc *Service) currentResultWithFreshToken(ctx context.Context, instanceID string) (*InstanceResult, error) {
+// currentResult returns an already-RUNNING instance's current routing info
+// without touching the Host Agent — used when ResumeInstance is called on
+// an instance that turns out not to need resuming (§4.2's idempotency
+// note). host_agent_addr, not guest_ip/guest_port: the Host Agent is the
+// only thing that ever resolves an instance to a live guest address (§4.3).
+func (svc *Service) currentResult(ctx context.Context, instanceID string) (*InstanceResult, error) {
 	inst, err := svc.store.GetInstance(ctx, instanceID)
 	if err != nil {
 		return nil, err
 	}
-	w, err := svc.store.GetWorkload(ctx, inst.WorkloadID)
-	if err != nil {
-		return nil, err
-	}
-	tok, exp, err := svc.tokens.Issue(instanceID, inst.GuestIP, inst.GuestPort, inst.HostID, w.IdleTimeoutSeconds)
+	host, err := svc.store.GetHost(ctx, inst.HostID)
 	if err != nil {
 		return nil, err
 	}
 	return &InstanceResult{
 		InstanceID: instanceID, State: inst.State, HostID: inst.HostID,
-		GuestIP: inst.GuestIP, GuestPort: inst.GuestPort,
-		RoutingToken: tok, TokenExp: exp,
+		HostAgentAddr: host.InternalAddr,
 	}, nil
 }
 
@@ -335,7 +361,7 @@ func (svc *Service) waitForResumeToSettle(ctx context.Context, instanceID string
 			return nil, err
 		}
 		if inst.State != common.InstanceResuming {
-			return svc.currentResultWithFreshToken(ctx, instanceID)
+			return svc.currentResult(ctx, instanceID)
 		}
 		select {
 		case <-ctx.Done():
@@ -347,9 +373,11 @@ func (svc *Service) waitForResumeToSettle(ctx context.Context, instanceID string
 }
 
 // finishBootOrResume is the shared tail of CreateInstance and
-// ResumeInstance's success path: CAS into RUNNING, persist the endpoint,
-// touch activity, account host capacity, issue a routing token.
-func (svc *Service) finishBootOrResume(ctx context.Context, instanceID string, from common.InstanceState, hostID string, ep VMEndpoint, idleTimeoutSeconds int) (*InstanceResult, error) {
+// ResumeInstance's success path: CAS into RUNNING, persist the endpoint
+// (observability only, §4.2's data schema note — never read back for
+// routing), touch activity, account host capacity, and hand back the Host
+// Agent's address for the caller to route through (§4.3).
+func (svc *Service) finishBootOrResume(ctx context.Context, instanceID string, from common.InstanceState, hostID, hostAddr string, ep VMEndpoint, idleTimeoutSeconds int) (*InstanceResult, error) {
 	if _, _, err := svc.store.CAS(ctx, instanceID, from, common.InstanceRunning); err != nil {
 		return nil, err
 	}
@@ -375,14 +403,9 @@ func (svc *Service) finishBootOrResume(ctx context.Context, instanceID string, f
 	if err := svc.store.AdjustHostCapacity(ctx, hostID, 1); err != nil {
 		slog.Error("failed to increment host capacity", "instance_id", instanceID, "host_id", hostID, "error", err)
 	}
-	tok, exp, err := svc.tokens.Issue(instanceID, ep.GuestIP, ep.GuestPort, hostID, idleTimeoutSeconds)
-	if err != nil {
-		return nil, err
-	}
 	return &InstanceResult{
 		InstanceID: instanceID, State: common.InstanceRunning, HostID: hostID,
-		GuestIP: ep.GuestIP, GuestPort: ep.GuestPort,
-		RoutingToken: tok, TokenExp: exp,
+		HostAgentAddr: hostAddr,
 	}, nil
 }
 

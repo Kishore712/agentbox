@@ -42,7 +42,7 @@ func requireImageBuilderEnvironment(t *testing.T) {
 	requireCommand(t, "mount")
 	requireCommand(t, "umount")
 	requireCommand(t, "tar")
-	requireCommand(t, "dd")
+	requireCommand(t, "truncate")
 	if os.Geteuid() != 0 {
 		t.Skip("the real Image Builder pipeline needs root (mount requires it) — run as root or with CAP_SYS_ADMIN")
 	}

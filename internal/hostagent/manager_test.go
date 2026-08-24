@@ -3,6 +3,7 @@ package hostagent
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +32,9 @@ type fakeHostOps struct {
 	deletedInstances   map[string]bool
 	stoppedProcesses   map[string]bool
 	torndownNetworks   map[string]bool
+	hasRootfsErr       error
+	saveRootfsErr      error
+	savedRootfs        map[string][]byte
 }
 
 func newFakeHostOps() *fakeHostOps {
@@ -41,6 +45,7 @@ func newFakeHostOps() *fakeHostOps {
 		deletedInstances: map[string]bool{},
 		stoppedProcesses: map[string]bool{},
 		torndownNetworks: map[string]bool{},
+		savedRootfs:      map[string][]byte{},
 	}
 }
 
@@ -101,6 +106,10 @@ func (f *fakeHostOps) SnapshotPaths(instanceID string) (string, string) {
 	return base + "vmstate", base + "mem_file"
 }
 
+func (f *fakeHostOps) PrepareSnapshotDir(ctx context.Context, instanceID string) error {
+	return nil
+}
+
 func (f *fakeHostOps) SocketPath(instanceID string) string {
 	return "/run/firecracker/" + instanceID + ".socket"
 }
@@ -135,6 +144,30 @@ func (f *fakeHostOps) DeleteInstanceFiles(ctx context.Context, instanceID string
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deletedInstances[instanceID] = true
+	return nil
+}
+
+func (f *fakeHostOps) HasRootfs(ctx context.Context, rootfsPath string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.hasRootfsErr != nil {
+		return false, f.hasRootfsErr
+	}
+	_, ok := f.savedRootfs[rootfsPath]
+	return ok, nil
+}
+
+func (f *fakeHostOps) SaveRootfs(ctx context.Context, rootfsPath string, data io.Reader) error {
+	if f.saveRootfsErr != nil {
+		return f.saveRootfsErr
+	}
+	b, err := io.ReadAll(data)
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.savedRootfs[rootfsPath] = b
 	return nil
 }
 
@@ -218,12 +251,41 @@ func (f *fakeReadiness) WaitReady(ctx context.Context, addr string, timeout time
 	return f.err
 }
 
+// fakeGuestProxy records the last Forward call and returns a canned
+// response/error — the manager tests care about registry resolution
+// (does Proxy find the right guest_ip:port), not real HTTP forwarding,
+// which is guestproxy_test.go's job.
+type fakeGuestProxy struct {
+	mu              sync.Mutex
+	lastGuestIP     string
+	lastGuestPort   int
+	forwardErr      error
+	forwardResponse *ProxyResponse
+}
+
+func (f *fakeGuestProxy) Forward(ctx context.Context, guestIP string, guestPort int, req *ProxyRequest) (*ProxyResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastGuestIP, f.lastGuestPort = guestIP, guestPort
+	if f.forwardErr != nil {
+		return nil, f.forwardErr
+	}
+	if f.forwardResponse != nil {
+		return f.forwardResponse, nil
+	}
+	return &ProxyResponse{StatusCode: 200}, nil
+}
+
 func newTestManager(ops HostOps, fc *fakeFirecrackerClient, readiness ReadinessChecker) *VMManager {
+	return newTestManagerWithProxy(ops, fc, readiness, &fakeGuestProxy{})
+}
+
+func newTestManagerWithProxy(ops HostOps, fc *fakeFirecrackerClient, readiness ReadinessChecker, proxy GuestProxy) *VMManager {
 	return NewVMManager(ops, func(string) FirecrackerClient { return fc }, readiness, Config{
 		KernelImagePath: "/data/vmlinux",
 		GuestPort:       8080,
 		BootTimeout:     time.Second,
-	})
+	}, proxy)
 }
 
 // --- BootVM ---
@@ -474,5 +536,152 @@ func TestDeleteVM_IgnoresStopAndTeardownErrorsButNotDeleteError(t *testing.T) {
 	ops.deleteFilesErr = errors.New("disk error")
 	if err := m.DeleteVM(context.Background(), "inst-2"); err == nil {
 		t.Fatal("a real DeleteInstanceFiles failure should surface as an error")
+	}
+}
+
+// --- Golden rootfs check-and-push (design doc §4.6, placement locality) ---
+
+func TestHasRootfs_TrueAfterSave(t *testing.T) {
+	ops := newFakeHostOps()
+	m := newTestManager(ops, &fakeFirecrackerClient{}, &fakeReadiness{})
+
+	if err := m.SaveRootfs(context.Background(), "/data/workloads/wl_1/rootfs.ext4", strings.NewReader("bytes")); err != nil {
+		t.Fatal(err)
+	}
+	has, err := m.HasRootfs(context.Background(), "/data/workloads/wl_1/rootfs.ext4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has {
+		t.Error("expected HasRootfs to report true after SaveRootfs")
+	}
+}
+
+func TestHasRootfs_FalseForUnknownPath(t *testing.T) {
+	m := newTestManager(newFakeHostOps(), &fakeFirecrackerClient{}, &fakeReadiness{})
+	has, err := m.HasRootfs(context.Background(), "/data/workloads/never-pushed/rootfs.ext4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has {
+		t.Error("expected HasRootfs to report false for a path never saved")
+	}
+}
+
+// --- Live instance registry + Proxy (design doc §4.3) ---
+
+func TestProxy_ResolvesInstanceIDToCurrentGuestEndpoint(t *testing.T) {
+	ops := newFakeHostOps()
+	fc := &fakeFirecrackerClient{}
+	proxy := &fakeGuestProxy{}
+	m := newTestManagerWithProxy(ops, fc, &fakeReadiness{}, proxy)
+
+	if _, err := m.BootVM(context.Background(), BootRequest{InstanceID: "inst-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Proxy(context.Background(), "inst-1", &ProxyRequest{Method: "GET"}); err != nil {
+		t.Fatalf("Proxy: %v", err)
+	}
+	if proxy.lastGuestIP != "172.16.0.2" || proxy.lastGuestPort != 8080 {
+		t.Errorf("proxy forwarded to %s:%d, want the registered 172.16.0.2:8080", proxy.lastGuestIP, proxy.lastGuestPort)
+	}
+}
+
+func TestProxy_UnknownInstanceReturnsErrInstanceNotRegistered(t *testing.T) {
+	m := newTestManager(newFakeHostOps(), &fakeFirecrackerClient{}, &fakeReadiness{})
+	_, err := m.Proxy(context.Background(), "never-booted", &ProxyRequest{Method: "GET"})
+	if !errors.Is(err, ErrInstanceNotRegistered) {
+		t.Fatalf("got %v, want ErrInstanceNotRegistered", err)
+	}
+}
+
+func TestProxy_AfterSuspendReturnsErrInstanceNotRegistered(t *testing.T) {
+	ops := newFakeHostOps()
+	fc := &fakeFirecrackerClient{}
+	m := newTestManager(ops, fc, &fakeReadiness{})
+
+	if _, err := m.BootVM(context.Background(), BootRequest{InstanceID: "inst-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SuspendVM(context.Background(), "inst-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Proxy(context.Background(), "inst-1", &ProxyRequest{Method: "GET"}); !errors.Is(err, ErrInstanceNotRegistered) {
+		t.Fatalf("got %v, want ErrInstanceNotRegistered — suspend must deregister the instance", err)
+	}
+}
+
+// TestProxy_SurvivesFailedSuspendPause is the concurrency-correctness case
+// the design doc calls out explicitly: a Pause failure leaves the instance
+// running and routable (matching the Controller's own revert-to-RUNNING
+// behavior on a failed suspend call, §4.2) — deregistering here would make
+// a perfectly healthy instance unreachable for no reason.
+func TestProxy_SurvivesFailedSuspendPause(t *testing.T) {
+	ops := newFakeHostOps()
+	fc := &fakeFirecrackerClient{pauseErr: errors.New("firecracker unreachable")}
+	m := newTestManager(ops, fc, &fakeReadiness{})
+
+	if _, err := m.BootVM(context.Background(), BootRequest{InstanceID: "inst-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SuspendVM(context.Background(), "inst-1"); err == nil {
+		t.Fatal("expected SuspendVM to fail")
+	}
+	if _, err := m.Proxy(context.Background(), "inst-1", &ProxyRequest{Method: "GET"}); err != nil {
+		t.Fatalf("instance should still be registered after a failed Pause, got: %v", err)
+	}
+}
+
+func TestProxy_AfterResumeUsesRefreshedEndpoint(t *testing.T) {
+	ops := newFakeHostOps()
+	fc := &fakeFirecrackerClient{}
+	proxy := &fakeGuestProxy{}
+	m := newTestManagerWithProxy(ops, fc, &fakeReadiness{}, proxy)
+
+	if _, err := m.BootVM(context.Background(), BootRequest{InstanceID: "inst-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SuspendVM(context.Background(), "inst-1"); err != nil {
+		t.Fatal(err)
+	}
+	ops.nextGuestIP = "172.16.0.9" // simulate a fresh IP on resume
+	if _, err := m.ResumeVM(context.Background(), "inst-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Proxy(context.Background(), "inst-1", &ProxyRequest{Method: "GET"}); err != nil {
+		t.Fatalf("Proxy: %v", err)
+	}
+	if proxy.lastGuestIP != "172.16.0.9" {
+		t.Errorf("proxy forwarded to %s, want the refreshed 172.16.0.9 — a stale registry entry would misroute", proxy.lastGuestIP)
+	}
+}
+
+func TestProxy_AfterDeleteReturnsErrInstanceNotRegistered(t *testing.T) {
+	ops := newFakeHostOps()
+	m := newTestManager(ops, &fakeFirecrackerClient{}, &fakeReadiness{})
+
+	if _, err := m.BootVM(context.Background(), BootRequest{InstanceID: "inst-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DeleteVM(context.Background(), "inst-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Proxy(context.Background(), "inst-1", &ProxyRequest{Method: "GET"}); !errors.Is(err, ErrInstanceNotRegistered) {
+		t.Fatalf("got %v, want ErrInstanceNotRegistered", err)
+	}
+}
+
+func TestProxy_ForwardErrorPropagates(t *testing.T) {
+	ops := newFakeHostOps()
+	proxy := &fakeGuestProxy{forwardErr: errors.New("connection refused")}
+	m := newTestManagerWithProxy(ops, &fakeFirecrackerClient{}, &fakeReadiness{}, proxy)
+
+	if _, err := m.BootVM(context.Background(), BootRequest{InstanceID: "inst-1"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := m.Proxy(context.Background(), "inst-1", &ProxyRequest{Method: "GET"})
+	if err == nil || errors.Is(err, ErrInstanceNotRegistered) {
+		t.Fatalf("got %v, want the raw guest-unreachable error, distinct from ErrInstanceNotRegistered", err)
 	}
 }

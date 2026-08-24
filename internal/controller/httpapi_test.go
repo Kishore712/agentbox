@@ -112,9 +112,14 @@ func TestHTTP_CreateInstance_FullContract(t *testing.T) {
 	if body["state"] != "RUNNING" {
 		t.Fatalf("state = %v, want RUNNING", body["state"])
 	}
-	for _, field := range []string{"instance_id", "host_id", "guest_ip", "guest_port", "routing_token", "token_exp"} {
+	for _, field := range []string{"instance_id", "host_id", "host_agent_addr"} {
 		if _, ok := body[field]; !ok {
 			t.Errorf("response missing field %q: %v", field, body)
+		}
+	}
+	for _, field := range []string{"guest_ip", "guest_port", "routing_token", "token_exp"} {
+		if _, present := body[field]; present {
+			t.Errorf("response must never carry %q — only the Host Agent ever resolves a live guest address (§4.3)", field)
 		}
 	}
 }

@@ -3,8 +3,11 @@ package controller
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -112,5 +115,67 @@ func TestHTTPHostAgentClient_ResumeVM_Success(t *testing.T) {
 	}
 	if ep.GuestIP != "172.16.0.9" {
 		t.Errorf("got %+v", ep)
+	}
+}
+
+// --- HasRootfs / PushRootfs (§4.6, placement locality) ---
+
+func TestHTTPHostAgentClient_HasRootfs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/golden-rootfs" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if r.URL.Query().Get("path") != "/data/workloads/wl_1/rootfs.ext4" {
+			t.Errorf("path query param = %q", r.URL.Query().Get("path"))
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := NewHTTPHostAgentClient()
+	has, err := c.HasRootfs(t.Context(), strings.TrimPrefix(srv.URL, "http://"), "/data/workloads/wl_1/rootfs.ext4")
+	if err != nil {
+		t.Fatalf("HasRootfs: %v", err)
+	}
+	if has {
+		t.Error("expected false for a 404 response")
+	}
+}
+
+func TestHTTPHostAgentClient_PushRootfs_StreamsLocalFile(t *testing.T) {
+	dir := t.TempDir()
+	localPath := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(localPath, []byte("golden rootfs bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/golden-rootfs" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewHTTPHostAgentClient()
+	if err := c.PushRootfs(t.Context(), strings.TrimPrefix(srv.URL, "http://"), localPath); err != nil {
+		t.Fatalf("PushRootfs: %v", err)
+	}
+	if string(gotBody) != "golden rootfs bytes" {
+		t.Errorf("host agent received %q, want the local file's contents", gotBody)
+	}
+}
+
+func TestHTTPHostAgentClient_PushRootfs_MissingLocalFile(t *testing.T) {
+	c := NewHTTPHostAgentClient()
+	err := c.PushRootfs(t.Context(), "unused:9000", "/does/not/exist/rootfs.ext4")
+	if err == nil {
+		t.Fatal("expected an error when the local rootfs file doesn't exist")
 	}
 }

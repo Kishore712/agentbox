@@ -38,6 +38,7 @@ type Config struct {
 	JailerChrootBaseDir string
 	JailerUID           int
 	JailerGID           int
+	GuestProxyTimeout   time.Duration // Host Agent → guest, the actual final hop (§4.3's data-plane proxy)
 	LogLevel            string
 	LogFormat           string
 }
@@ -79,6 +80,9 @@ func loadConfig() (Config, error) {
 		return cfg, fmt.Errorf("load config: %w", err)
 	}
 	if cfg.JailerGID, err = config.Int("JAILER_GID", 0); err != nil {
+		return cfg, fmt.Errorf("load config: %w", err)
+	}
+	if cfg.GuestProxyTimeout, err = config.Duration("GUEST_PROXY_TIMEOUT", 30*time.Second); err != nil {
 		return cfg, fmt.Errorf("load config: %w", err)
 	}
 	return cfg, nil
@@ -126,6 +130,7 @@ func main() {
 			GuestPort:       cfg.GuestPort,
 			BootTimeout:     cfg.BootTimeout,
 		},
+		hostagent.NewHTTPGuestProxy(cfg.GuestProxyTimeout),
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

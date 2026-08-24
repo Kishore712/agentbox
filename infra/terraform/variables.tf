@@ -27,3 +27,15 @@ variable "machine_type" {
   type        = string
   default     = "n2-standard-4"
 }
+
+variable "control_plane_instance_name" {
+  description = "Name of the VM running Controller + REST API Service (design doc §4.1/§4.2) — no KVM involved, deliberately separate from the Firecracker host."
+  type        = string
+  default     = "control-plane"
+}
+
+variable "control_plane_machine_type" {
+  description = "Machine type for the control-plane VM. No nested virtualization needed — any family works; picked for cost, not capability."
+  type        = string
+  default     = "e2-small"
+}

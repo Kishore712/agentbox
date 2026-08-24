@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"os"
 	"time"
 )
 
@@ -46,6 +48,55 @@ func (c *HTTPHostAgentClient) ResumeVM(ctx context.Context, hostAddr, instanceID
 
 func (c *HTTPHostAgentClient) DeleteVM(ctx context.Context, hostAddr, instanceID string) error {
 	return c.doJSON(ctx, http.MethodDelete, hostAddr, "/vm/"+instanceID, nil, nil)
+}
+
+func (c *HTTPHostAgentClient) HasRootfs(ctx context.Context, hostAddr, rootfsRef string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "http://"+hostAddr+"/golden-rootfs?path="+url.QueryEscape(rootfsRef), nil)
+	if err != nil {
+		return false, fmt.Errorf("build request: %w", err)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("host agent request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("host agent returned unexpected status %d checking rootfs %q", resp.StatusCode, rootfsRef)
+	}
+}
+
+// PushRootfs streams the local rootfs.ext4 file at rootfsRef to hostAddr.
+// Only ever called after HasRootfs reports it's missing (§4.6) — this is
+// the (potentially large) transfer that check exists to avoid repeating.
+func (c *HTTPHostAgentClient) PushRootfs(ctx context.Context, hostAddr, rootfsRef string) error {
+	f, err := os.Open(rootfsRef)
+	if err != nil {
+		return fmt.Errorf("open local rootfs %q: %w", rootfsRef, err)
+	}
+	defer f.Close()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://"+hostAddr+"/golden-rootfs?path="+url.QueryEscape(rootfsRef), f)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("host agent request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		var errBody struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&errBody)
+		return &httpStatusError{status: resp.StatusCode, body: errBody.Error}
+	}
+	return nil
 }
 
 type httpStatusError struct {
